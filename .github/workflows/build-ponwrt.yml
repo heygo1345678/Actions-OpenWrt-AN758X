@@ -251,27 +251,41 @@ jobs:
           save-always: true
 
       # =========================================================
-      # 4. 更新并安装 Feeds
+      # 4. 更新并安装 Feeds（含自动补全历史并降级 sing-box）
       # =========================================================
       - name: Update & install feeds
         run: |
           cd "$BUILD_ROOT/openwrt"
-          # 1. 💡 加在这里：清理可能被 Go 1.27 污染的模块缓存
-          rm -rf dl/go-mod-cache 2>/dev/null || true
           
+          # 清理可能被高版本 Go 污染的模块缓存
+          rm -rf dl/go-mod-cache 2>/dev/null || true
+
           if [ -n "${FEEDS_CONF}" ] && [ -e "$GITHUB_WORKSPACE/${FEEDS_CONF}" ]; then
             cp "$GITHUB_WORKSPACE/${FEEDS_CONF}" feeds.conf.default
           fi
+          
+          # 1. 拉取 feeds 源码
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-
-          # 2. 【核心修复】将 feeds/packages 中的 sing-box 定向回退到 1.12.25 版本 (commit: ea7367905)
-          echo "正在将 sing-box 回退到go1.27兼容的 1.12.25 版本..."
+          
+          # 2. 【核心修复】进入 packages 目录，拉取完整历史并安全回退 sing-box
+          echo "正在为 feeds/packages 补充历史记录并回退 sing-box..."
           cd feeds/packages
-          git checkout ea7367905 -- net/sing-box
+          
+          # 尝试解除浅克隆或拉取足够深度的历史记录（防止找不到旧 commit）
+          git fetch --unshallow 2>/dev/null || git fetch origin master --depth=1000 2>/dev/null || true
+          
+          # 校验并执行回退
+          if git rev-parse --verify ea7367905 >/dev/null 2>&1; then
+            git checkout ea7367905 -- net/sing-box
+            echo "sing-box 成功回退到 1.12.25 版本！"
+          else
+            echo "::error::未找到指定的 commit: ea7367905"
+            exit 1
+          fi
           cd ../..
 
-          # 3. 重新安装 feeds，使回退后的 sing-box 软链接生效
+          # 3. 重新安装 feeds，使回退生效
           ./scripts/feeds install -a
           
       # =========================================================
