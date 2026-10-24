@@ -257,7 +257,7 @@ jobs:
         run: |
           cd "$BUILD_ROOT/openwrt"
           # 💡 加在这里：清理可能被 Go 1.27 污染的模块缓存
-          # rm -rf dl/go-mod-cache 2>/dev/null || true
+          rm -rf dl/go-mod-cache 2>/dev/null || true
           
           if [ -n "${FEEDS_CONF}" ] && [ -e "$GITHUB_WORKSPACE/${FEEDS_CONF}" ]; then
             cp "$GITHUB_WORKSPACE/${FEEDS_CONF}" feeds.conf.default
