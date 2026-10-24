@@ -251,13 +251,13 @@ jobs:
           save-always: true
 
       # =========================================================
-      # 4. 更新并安装 Feeds（含自动补全历史并降级 sing-box）
+      # 4. 更新并安装 Feeds（含 sing-box 降级与清理冲突补丁）
       # =========================================================
       - name: Update & install feeds
         run: |
           cd "$BUILD_ROOT/openwrt"
           
-          # 清理可能被高版本 Go 污染的模块缓存
+          # 清理可能被高版本污染的模块缓存
           rm -rf dl/go-mod-cache 2>/dev/null || true
 
           if [ -n "${FEEDS_CONF}" ] && [ -e "$GITHUB_WORKSPACE/${FEEDS_CONF}" ]; then
@@ -268,24 +268,24 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           
-          # 2. 【核心修复】进入 packages 目录，拉取完整历史并安全回退 sing-box
-          echo "正在为 feeds/packages 补充历史记录并回退 sing-box..."
+          # 2. 【核心修复】回退 sing-box 到 1.12.25 并删除不兼容的补丁
+          echo "正在回退 sing-box 并清理冲突补丁..."
           cd feeds/packages
-          
-          # 尝试解除浅克隆或拉取足够深度的历史记录（防止找不到旧 commit）
           git fetch --unshallow 2>/dev/null || git fetch origin master --depth=1000 2>/dev/null || true
           
-          # 校验并执行回退
           if git rev-parse --verify ea7367905 >/dev/null 2>&1; then
             git checkout ea7367905 -- net/sing-box
             echo "sing-box 成功回退到 1.12.25 版本！"
+            
+            # 关键修复：删除在 1.12.25 中会导致打补丁失败的冲突补丁文件
+            rm -f net/sing-box/patches/100-use-system-libcronet.patch
           else
             echo "::error::未找到指定的 commit: ea7367905"
             exit 1
           fi
           cd ../..
 
-          # 3. 重新安装 feeds，使回退生效
+          # 3. 重新安装 feeds，使修改生效
           ./scripts/feeds install -a
           
       # =========================================================
