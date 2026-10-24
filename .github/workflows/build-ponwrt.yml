@@ -256,7 +256,7 @@ jobs:
       - name: Update & install feeds
         run: |
           cd "$BUILD_ROOT/openwrt"
-          # 💡 加在这里：清理可能被 Go 1.27 污染的模块缓存
+          # 1. 💡 加在这里：清理可能被 Go 1.27 污染的模块缓存
           rm -rf dl/go-mod-cache 2>/dev/null || true
           
           if [ -n "${FEEDS_CONF}" ] && [ -e "$GITHUB_WORKSPACE/${FEEDS_CONF}" ]; then
@@ -265,21 +265,13 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 2. 【精准回退】只把 sing-box 目录回退到 2026-10-01（兼容 Go 1.23 的时期）
-          echo "正在将 sing-box 单独回退到旧版本..."
+          # 2. 【核心修复】将 feeds/packages 中的 sing-box 定向回退到 1.12.25 版本 (commit: ea7367905)
+          echo "正在将 sing-box 回退到go1.27兼容的 1.12.25 版本..."
           cd feeds/packages
-          
-          # 查找 net/sing-box 在指定日期之前的最后一个合法 commit
-          OLD_COMMIT=$(git log -n 1 --before="2026-10-01" --pretty=format:"%H" -- net/sing-box)
-          if [ -n "$OLD_COMMIT" ]; then
-            echo "找到兼容的 sing-box 历史版本: $OLD_COMMIT"
-            git checkout "$OLD_COMMIT" -- net/sing-box
-          else
-            echo "::warning::未找到指定日期的 commit，跳过回退"
-          fi
+          git checkout ea7367905 -- net/sing-box
           cd ../..
 
-          # 3. 重新安装 feeds，使回退后的 sing-box 生效
+          # 3. 重新安装 feeds，使回退后的 sing-box 软链接生效
           ./scripts/feeds install -a
           
       # =========================================================
