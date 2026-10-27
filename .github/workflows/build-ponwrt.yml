@@ -768,6 +768,32 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/$DIY_P1_SH"
           "$GITHUB_WORKSPACE/$DIY_P1_SH"
 
+      # =========================================================
+      # 5.5 放宽 rust 包的「禁止联网」（--frozen / --offline）
+      #
+      #   h3c-fttr-tools 的 Makefile 写的是
+      #     cargo install ... --locked --frozen
+      #   --frozen = 锁定版本 + 禁止联网，只认 CARGO_HOME(dl/cargo) 里已有的 crate。
+      #
+      #   而 dl/cargo 是从构建缓存继承的（只增不减），包上游一旦在
+      #   Cargo.lock 里加新依赖（这次是 core_detect v1.0.0），缓存里没有：
+      #     failed to download `core_detect v1.0.0`
+      #     attempting to make an HTTP request, but --frozen was specified
+      #   —— 编译到 rust 包必挂，且 --frozen 不给任何补救机会。
+      #
+      #   这里只摘掉「禁止联网」，--locked 保留：版本仍锁死在 Cargo.lock，
+      #   结果可复现；缺的 crate 当场补下。
+      #   必须在 diy-part1 之后（私有包是那一步 clone 进来的）。
+      # =========================================================
+      - name: Relax cargo offline flags
+        continue-on-error: true
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          S="$GITHUB_WORKSPACE/scripts/patch-cargo-offline.sh"
+          [ -f "$S" ] || { echo "::warning::缺 $S，跳过"; exit 0; }
+          dos2unix "$S" 2>/dev/null || true
+          bash "$S" "$BUILD_ROOT/openwrt"
+
 
       # =========================================================
       # 6. 加载 .config —— 源码基座 defconfig 打底 + 机型精简配置追加
@@ -1069,6 +1095,39 @@ jobs:
           mkdir -p tmp && echo 1 > tmp/.build
 
       # =========================================================
+      # 10.05 ★ 工具链一编完就存一次缓存（不等编译结束）
+      #
+      #   为什么：job 的 timeout-minutes 是 350，而全量编译经常跑满
+      #   5~6 小时。一旦超时，GitHub 会把 job 直接 cancel —— 排在
+      #   编译后面的「Save build cache」根本没机会执行，1~1.5 小时的
+      #   工具链白编。
+      #
+      #   这里在工具链刚编完、固件还没开始时先存一份。超时也罢、
+      #   编译失败也罢，下次都能直接跳过 tools/toolchain。
+      #
+      #   代价：本次编译期间增长的 .ccache 不在这一份里（下一轮补）。
+      #   ccache 是可再生的，丢它比丢工具链便宜得多。
+      #
+      #   ⚠ 后面「Save build cache」用的是同一个 key。早期已经存过时
+      #     这里会跳过它（条件里看 save-early 的 outcome），否则那次 save
+      #     只会拿到 "already exists" 的报错，白跑一趟。
+      # =========================================================
+      - name: Save build cache (right after toolchain)
+        id: save-early
+        if: >-
+          success()
+          && steps.toolchain.outcome == 'success'
+          && steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          key: ${{ steps.cache-key.outputs.key }}
+          path: |
+            ${{ env.CACHE_ROOT }}/.ccache
+            ${{ env.CACHE_ROOT }}/staging_dir/host*
+            ${{ env.CACHE_ROOT }}/staging_dir/tool*
+
+      # =========================================================
       # 10.1 缓存决策写进 Summary —— 命中与否一眼可见
       # =========================================================
       - name: Cache decision
@@ -1169,14 +1228,30 @@ jobs:
         if: env.BUILD_SCOPE != 'toolchain-only'
         run: |
           cd "$BUILD_ROOT/openwrt"
+
+          # ⚠ 三次都失败就必须失败退出，不能「默默继续」。
+          #   之前这里是 if make ...; then break; fi，三次失败也照样往下走，
+          #   于是「下载不全」一直拖到编译阶段才爆，报的却是完全不相干的错
+          #   （例如 cargo --frozen 说缺 crate，根因其实是这里没下全）。
+          OK=0
           for i in 1 2 3; do
             echo "===== 第 $i 次尝试: make download ====="
-            if make download -j8; then break; fi
+            if make download -j8; then OK=1; break; fi
+            echo "::warning::第 $i 次 make download 失败，5 秒后重试"
             sleep 5
           done
+
           # 清理下载失败残留的小文件
           find dl -size -1024c -type f -exec ls -l {} \; 2>/dev/null
           find dl -size -1024c -type f -exec rm -f {} \; 2>/dev/null
+          echo "dl 目录共 $(ls -1 dl 2>/dev/null | wc -l) 个文件"
+
+          if [ "$OK" -ne 1 ]; then
+            echo "::error::make download 连试 3 次仍失败 —— 先修下载，别往下编"
+            echo "::error::继续编译只会在几十分钟后给出更难懂的错（cargo 缺 crate / 解压失败等）"
+            echo "::error::排查：在上面 make download 输出里搜 'ERROR:' 或 'failed to download'"
+            exit 1
+          fi
           echo "dl 目录共 $(ls -1 dl 2>/dev/null | wc -l) 个文件"
 
       # =========================================================
@@ -1255,6 +1330,7 @@ jobs:
         if: >-
           success()
           && steps.cache-restore.outputs.cache-hit != 'true'
+          && steps.save-early.outcome != 'success'
           && (steps.compile.outcome == 'success' || steps.toolchain.outcome == 'success')
         uses: actions/cache/save@v5
         continue-on-error: true

@@ -193,6 +193,40 @@ diy 脚本都不进 key。上游一提交就换一代，恢复时靠 `restore-ke
 - 轮换时 **dl 也参与**：按周号分组、只留最新一代。dl 是「只增不减」的，
   新一代必定是旧一代的超集，留旧的只会白占 10GB 配额、把工具链缓存挤出去
 
+### 工具链缓存在什么时机写
+
+两处，key 相同，先成功的算数：
+
+1. **工具链刚编完就存一次**（`Build tools & toolchain` 之后）—— 因为 job 上限 350 分钟，
+   全量编译经常跑满；一旦超时被 cancel，排在编译后面的保存步骤根本没机会执行，
+   1~1.5 小时的工具链就白编了
+2. 编译成功后再存（只在第 1 步没存过时生效，否则同 key 会 `already exists`）
+
+### rust 包的离线限制（`--frozen`）
+
+`h3c-fttr-tools` 的 Makefile 里是 `cargo install ... --locked --frozen`。
+`--frozen` = 锁定版本 **+ 禁止联网**，只认 `CARGO_HOME=dl/cargo` 里已有的 crate。
+而 `dl/cargo` 是从缓存继承的（只增不减），包上游一旦在 `Cargo.lock` 里加新依赖，
+缓存里就没有它：
+
+```
+failed to download `core_detect v1.0.0`
+attempting to make an HTTP request, but --frozen was specified
+```
+
+`scripts/patch-cargo-offline.sh` 在 `diy-part1.sh` 之后把这些 Makefile 里的
+`--frozen` / `--offline` 摘掉（**`--locked` 保留**，版本仍锁死在 Cargo.lock，
+结果可复现；去掉的只是「不许联网」这一条）。
+
+> 更正统的做法在私有包侧：`Build/Prepare` 里显式 `cargo fetch --locked`
+> 把 crate 拉进 `CARGO_HOME`，编译阶段再用 `--frozen`。两者可以共存。
+
+### `make download` 失败不再被吞掉
+
+以前是「试 3 次，失败也继续」，于是下载不全的问题一直拖到编译阶段才爆，
+报的还是完全不相干的错（上面那条 `cargo` 报错就是典型）。现在三次都失败会直接
+`::error::` 退出，并提示去 make download 输出里搜 `ERROR:` / `failed to download`。
+
 配套的四个工作流：
 
 | 工作流 | 作用 |
