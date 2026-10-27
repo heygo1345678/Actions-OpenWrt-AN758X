@@ -112,6 +112,36 @@ for t in cargo rustc rustdoc; do
 done
 
 # ---------------------------------------------------------------
+# 4.5 纠正 staging_dir 里那三个「指向上次 runner」的符号链接
+#
+#   场景：构建缓存命中 → staging_dir/host/bin/rustc 是上一次运行留下的
+#   符号链接，指向 /home/runner/.rustup/toolchains/<toolchain>/bin/rustc。
+#
+#   正常情况下这个路径每次都一样，链接不会坏。但一旦镜像换了 rustup
+#   布局、或工具链名从 stable 变掉，它就是【悬空】的 —— 而
+#   Host/Install 只在 stamp 失效时才会重跑，不会自动帮我们修，
+#   于是 make 编译 Rust 包时报
+#     /bin/sh: .../staging_dir/host/bin/rustc: not found
+#   看起来像缓存坏了，其实是链接指错了地方。
+#
+#   这里直接就地改正：只动「符号链接」，源码自举出来的真实二进制不碰。
+#   成本为零，且让缓存恢复不再依赖 rustup 路径恰好稳定。
+# ---------------------------------------------------------------
+LINKED=0
+for d in "$PWD/staging_dir/host/bin" "$PWD/staging_dir/hostpkg/bin"; do
+  [ -d "$d" ] || continue
+  for t in cargo rustc rustdoc; do
+    if [ -L "$d/$t" ]; then
+      ln -sfn "$RUST_ROOT/bin/$t" "$d/$t"
+      LINKED=$((LINKED + 1))
+    fi
+  done
+done
+if [ "$LINKED" -gt 0 ]; then
+  log "已纠正 $LINKED 个 staging_dir 里的 rust 符号链接（缓存恢复的残留）"
+fi
+
+# ---------------------------------------------------------------
 # 5. 注入 ci-prebuilt.mk，替换源码自举
 #
 #    必须在 OpenWrt 展开 HostBuild 规则【之前】插入，
