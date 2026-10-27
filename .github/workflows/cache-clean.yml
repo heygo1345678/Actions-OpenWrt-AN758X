@@ -33,7 +33,7 @@ on:
           - prefix
           - all
       prefix:
-        description: 'mode=prefix 时要删的前缀（如 ponwrt-pbs05-ponwrt-master-an7581）'
+        description: 'mode=prefix 时要删的前缀（如 ponwrt-pbs05-ponwrt-master-an7581-prebuilt）'
         required: false
         default: ''
   schedule:

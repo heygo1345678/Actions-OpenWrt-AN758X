@@ -74,10 +74,18 @@ slug() { printf '%s' "${1:-unknown}" | tr -c 'A-Za-z0-9._-' '-'; }
 #   保证两处永远不会算出不同的前缀。
 # ---------------------------------------------------------------
 cache_prefix() {
-  printf 'ponwrt-%s-%s-%s' \
+  # ★ HOST_MODE 必须进前缀，否则两种模式的缓存会互相污染：
+  #     prebuilt = 用 runner 预装的 go / rust / llvm，产物是【符号链接】
+  #     source   = 从源码真实编译，产物是【真二进制】
+  #   切模式后若命中对方那一份，make 看到 installed stamp 就跳过，
+  #   实际拿到的是悬空链接（或缺少目标 std），错误会埋在编译期很难查。
+  #   分族之后，切模式只是「换一条缓存线」，不会踩到对方的产物。
+  local mode; mode=$(slug "${HOST_MODE:-prebuilt}")
+  printf 'ponwrt-%s-%s-%s-%s' \
     "$(slug "${SOURCE:-unknown}")" \
     "$(slug "${REPO_BRANCH:-unknown}")" \
-    "$(slug "${SOC:-unknown}")"
+    "$(slug "${SOC:-unknown}")" \
+    "$mode"
 }
 
 cmd_prefix() {

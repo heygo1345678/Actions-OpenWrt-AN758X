@@ -202,6 +202,28 @@ diy 脚本都不进 key。上游一提交就换一代，恢复时靠 `restore-ke
    1~1.5 小时的工具链就白编了
 2. 编译成功后再存（只在第 1 步没存过时生效，否则同 key 会 `already exists`）
 
+### host 工具链：预编译 vs 源码真实编译
+
+`prebuilt_host` 这个输入决定 Go / Rust / LLVM 怎么来：
+
+| | `prebuilt_host=true`（默认） | `prebuilt_host=false` |
+|---|---|---|
+| Go | 用 runner 的 `/usr/lib/go-1.25` 做 bootstrap，最终 go 仍按 feed 版本自建 | 从 go1.4 起五段自举（+40~70 分钟） |
+| Rust | 用 runner 的 rustup stable（0 秒） | 从源码自举 rustc（+30~60 分钟） |
+| LLVM/BPF | 用 runner 的 `llvm-18` | OpenWrt 自己编 llvm-bpf（+20~40 分钟） |
+| host Python | 关 PGO（快） | 保持上游默认（带 PGO） |
+| 首次构建 | 快 1.5~2.5 小时 | 慢，但产物与「完全按上游从源码构建」一致 |
+| 之后的构建 | 靠缓存，两者一样快 | 靠缓存，两者一样快 |
+
+**两种模式不共用缓存**：`HOST_MODE`（`prebuilt` / `source`）会进缓存前缀，
+形如 `ponwrt-<源站>-<分支>-<SoC>-<prebuilt|source>`。
+原因很实在 —— 预编译模式在 `staging_dir` 里留的是**指向 runner 的符号链接**，
+源码模式留的是**真二进制**；混用会让 make 误判「已安装」，
+然后在编译期报一个完全对不上的错。
+
+所以切模式等于换一条缓存线，两边各自滚动、互不污染。`warm-cache.yml` 也有同一个
+输入，**必须和主流程选一样的值**，否则前缀不同、预热白跑。
+
 ### rust 包的离线限制（`--frozen`）
 
 `h3c-fttr-tools` 的 Makefile 里是 `cargo install ... --locked --frozen`。

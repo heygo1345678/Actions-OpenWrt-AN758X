@@ -55,6 +55,14 @@ on:
         options:
           - 'false'
           - 'true'
+      prebuilt_host:
+        description: 'Go/Rust 用 runner 预编译（false = 从源码真实编译，与主流程保持一致）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
       release_backup:
         description: '同时存一份到 Release 备份（与主流程同一个 release）'
         required: false
@@ -76,6 +84,9 @@ env:
   BUILD_ROOT: /workdir
   CACHE_ROOT: /workdir/openwrt
   CACHE_RELEASE: cache-backup
+  # 必须与主流程一致：HOST_MODE 进缓存前缀，两边不一致就永远命中不了
+  PREBUILT_HOST: ${{ github.event.inputs.prebuilt_host == 'false' && 'false' || 'true' }}
+  HOST_MODE: ${{ github.event.inputs.prebuilt_host == 'false' && 'source' || 'prebuilt' }}
   RELEASE_BACKUP: ${{ github.event.inputs.release_backup == 'false' && 'false' || 'true' }}
   SOURCE: ${{ github.event.inputs.source || 'pbs05/ponwrt' }}
   REPO_URL: ${{ github.event.inputs.source == 'fork' && 'https://github.com/qwe3017/ponwrt' || 'https://github.com/pbs05/ponwrt' }}
@@ -291,6 +302,7 @@ jobs:
           sed -i '/CONFIG_TARGET_DEVICE_/d; /^CONFIG_TARGET_MULTI_PROFILE=/d' .config
 
       - name: Prepare host toolchain (Go / BPF / Python)
+        if: env.PREBUILT_HOST == 'true'
         continue-on-error: true
         run: |
           cd "$CACHE_ROOT"
@@ -300,6 +312,7 @@ jobs:
           bash "$S" "$CACHE_ROOT"
 
       - name: Prepare Rust toolchain (prebuilt)
+        if: env.PREBUILT_HOST == 'true'
         continue-on-error: true
         run: |
           cd "$CACHE_ROOT"
@@ -347,11 +360,46 @@ jobs:
           touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
           mkdir -p tmp && echo 1 > tmp/.build
 
+      # =========================================================
+      # source 模式：把 golang / rust 也从源码编出来
+      #
+      #   它们不是 tools，`make tools/install` 不含它们；不在这里编，
+      #   预热出来的缓存就是「半份」—— 主流程还得自己扛 1.5 小时。
+      #   编完紧跟下面的 Save，于是这一趟就把 host 侧全齐了。
+      # =========================================================
+      - name: Build host go/rust from source
+        id: host-src
+        if: >-
+          env.PREBUILT_HOST != 'true'
+          && (env.IGNORE_CACHE == 'true'
+              || (steps.cache-restore.outputs.cache-matched-key == ''
+                  && steps.release-restore.outputs.restored != 'true'))
+        timeout-minutes: 200
+        run: |
+          cd "$CACHE_ROOT"
+          JOBS=$(nproc)
+          for p in golang-bootstrap golang rust; do
+            rel=$(find -L package -maxdepth 4 -type d -name "$p" 2>/dev/null | head -1)
+            [ -z "$rel" ] && { echo "::warning::树里没有 $p，跳过"; continue; }
+            echo "===== make $rel/host/compile ====="
+            make "$rel/download" >/dev/null 2>&1 || true
+            make "$rel/host/compile" -j"$JOBS" || make "$rel/host/compile" -j1 V=s || \
+              echo "::warning::$p host 编译失败（其余继续）"
+            case "$p" in rust) BIN=rustc ;; *) BIN=go ;; esac
+            HITS=$(find staging_dir -path "*/bin/$BIN" \( -type f -o -type l \) 2>/dev/null)
+            if [ -z "$HITS" ]; then
+              echo "::warning::$p: make 返回 0，但 staging_dir 里没有 $BIN"
+            else
+              echo "✅ $p 产物已就位"
+            fi
+          done
+          touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
+
       - name: Save build cache
         if: >-
           success()
           && steps.cache-restore.outputs.cache-hit != 'true'
-          && steps.toolchain.outcome == 'success'
+          && (steps.toolchain.outcome == 'success' || steps.host-src.outcome == 'success')
         uses: actions/cache/save@v5
         continue-on-error: true
         with:

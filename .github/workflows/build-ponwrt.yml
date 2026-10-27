@@ -20,6 +20,19 @@ env:
   USE_DL_CACHE: true
   USE_CCACHE: false
 
+  # =========================================================
+  # host 侧 go / rust / llvm 怎么来
+  #
+  #   prebuilt（默认）：用 runner 预装的，省 1.5~2.5 小时；
+  #                     代价是版本跟着镜像走，产物不可复现
+  #   source          ：全部从源码真实编译（OpenWrt 原生行为），
+  #                     首次 +1.5~2.5 小时，之后靠缓存
+  #
+  #   ★ 两种模式的产物形态不同（符号链接 vs 真二进制），所以
+  #     HOST_MODE 会进缓存前缀 —— 换模式等于换一条缓存线，互不影响。
+  # =========================================================
+  PREBUILT_HOST: ${{ github.event.inputs.prebuilt_host == 'false' && 'false' || 'true' }}
+  HOST_MODE: ${{ github.event.inputs.prebuilt_host == 'false' && 'source' || 'prebuilt' }}
   # 用 runner 预装的 rust stable（0 秒）还是按 feed 里 pin 的版本另装一个
   # （1~3 分钟）。默认 false：功能等价、省时间；要求产物可复现时改 true。
   RUST_PIN_FEED: false
@@ -178,6 +191,14 @@ on:
           - 'true'
       release_backup:
         description: 'Release 备份通道（actions/cache 7 天无访问会回收，Release 不会）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      prebuilt_host:
+        description: 'Go/Rust/LLVM 用 runner 预编译（false = 全部从源码真实编译，首次 +1.5~2.5 小时）'
         required: false
         default: 'true'
         type: choice
@@ -898,6 +919,7 @@ jobs:
       #   绝不让构建死在这里。
       # =========================================================
       - name: Prepare host toolchain (Go / BPF / Python)
+        if: env.PREBUILT_HOST == 'true'
         continue-on-error: true
         run: |
           cd "$BUILD_ROOT/openwrt"
@@ -907,6 +929,7 @@ jobs:
           bash "$S" "$BUILD_ROOT/openwrt"
 
       - name: Prepare Rust toolchain (prebuilt)
+        if: env.PREBUILT_HOST == 'true'
         continue-on-error: true
         run: |
           cd "$BUILD_ROOT/openwrt"
@@ -1097,6 +1120,65 @@ jobs:
           # （改 Makefile 会在上游调整缩进后失效，还会污染工作区）
           touch toolchain/stamp-compile tools/stamp-compile 2>/dev/null || true
           mkdir -p tmp && echo 1 > tmp/.build
+
+      # =========================================================
+      # 10.02 host 侧 go / rust 从源码真实编译（prebuilt_host=false 时）
+      #
+      #   为什么单独拎出来编，而不是等 make 自动带出来：
+      #     golang / rust 是【package】不是 tools —— `make tools/install`
+      #     和 `make toolchain/install` 都不含它们，它们是在
+      #     `make package/compile`（也就是固件编译那 5~6 小时）里被
+      #     依赖带出来的。那样有两个坏处：
+      #       1) 无法在 toolchain-only 这一趟里把缓存建全
+      #       2) 首次编译要多扛 1.5 小时，直接顶到 350 分钟上限
+      #     所以这里显式编：编完紧跟下一步的 early save，就都进缓存了。
+      #
+      #   ⚠ 只能写 host/compile —— 没有 host/install 这个目标。
+      #     host-build.mk 的依赖链是
+      #       host-compile → $(HOST_STAMP_INSTALLED) → Host/Install
+      #     即 host/compile 会自动把产物装进 staging_dir。
+      # =========================================================
+      - name: Build host go/rust from source
+        id: host-src
+        if: >-
+          env.PREBUILT_HOST != 'true'
+          && (env.IGNORE_CACHE == 'true'
+              || (steps.cache-restore.outputs.cache-matched-key == ''
+                  && steps.release-restore.outputs.restored != 'true'))
+        timeout-minutes: 200
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          JOBS=$(nproc)
+
+          for p in golang-bootstrap golang rust; do
+            # ⚠ -L 必须有：package/feeds/packages/* 是指向 feeds/packages/lang/*
+            #   的符号链接，find 默认不跟随，-type d 也不匹配符号链接本身，
+            #   结果连 package/feeds/packages/golang 都找不到 —— 三个包全被跳过。
+            rel=$(find -L package -maxdepth 4 -type d -name "$p" 2>/dev/null | head -1)
+            [ -z "$rel" ] && { echo "::warning::树里没有 $p，跳过"; continue; }
+
+            echo "===== make $rel/host/compile ====="
+            make "$rel/download" >/dev/null 2>&1 || true
+            # 不加 V=s：golang bootstrap 有 9000+ 个包，会刷上万行日志
+            make "$rel/host/compile" -j"$JOBS" || make "$rel/host/compile" -j1 V=s || \
+              echo "::warning::$p host 编译失败（其余继续）"
+
+            # 落地校验：make 返回 0 不等于真编出了东西
+            case "$p" in rust) BIN=rustc ;; *) BIN=go ;; esac
+            HITS=$(find staging_dir -path "*/bin/$BIN" \( -type f -o -type l \) 2>/dev/null)
+            if [ -z "$HITS" ]; then
+              echo "::warning::$p: make 返回 0，但 staging_dir 里没有 $BIN"
+              echo "::warning::$p: 常见原因 —— 包没有 HostBuild / target 名对不上"
+            else
+              echo "✅ $p 产物已就位: $(printf '%s' "$HITS" | head -1)"
+              # 源码模式不该有符号链接指向 runner；有就说明上一轮是 prebuilt
+              while IFS= read -r f; do
+                [ -e "$f" ] || echo "::warning::$p: $f 是悬空符号链接（缓存模式串了？）"
+              done <<< "$HITS"
+            fi
+          done
+
+          touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
 
       # =========================================================
       # 10.05 ★ 工具链一编完就存一次缓存（不等编译结束）
