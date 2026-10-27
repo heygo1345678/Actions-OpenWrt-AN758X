@@ -104,7 +104,7 @@ jobs:
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.PRIVATE_SOURCE_APP_ID }}
-          client-id: ${{ vars.PRIVATE_SOURCE_APP_CLIENT_ID }}
+          client-id: ${{ secrets.PRIVATE_SOURCE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PRIVATE_SOURCE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
