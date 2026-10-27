@@ -112,6 +112,39 @@ for t in cargo rustc rustdoc; do
 done
 
 # ---------------------------------------------------------------
+# 4.4 可选：按 feed 的版本另装一个 toolchain（RUST_PIN_FEED=1）
+#
+#   默认用 runner 的 stable —— 0 秒，够用。但 stable 会随镜像升级，
+#   同一个 commit 隔几周编出来的 rust 二进制 codegen 可能不同。
+#   要求「产物可复现 / 与官方构建逐字节接近」时打开这个开关：
+#   它读 feeds/packages/lang/rust/Makefile 的 PKG_VERSION，
+#   装一个同版本 toolchain（约 1~3 分钟），失败就退回 runner 的。
+# ---------------------------------------------------------------
+if [ "${RUST_PIN_FEED:-0}" = "1" ]; then
+  FEED_VER=$(sed -n 's/^PKG_VERSION:=//p' "$RUST_FEED/Makefile" 2>/dev/null | head -1 | tr -d ' \r')
+  PIN_OK=0
+  if [ -z "$FEED_VER" ]; then
+    warn "Rust: 读不到 feed 的 PKG_VERSION，继续用 runner 的 $RUST_TOOLCHAIN"
+  else
+    if ! rustup run "$FEED_VER" rustc --version >/dev/null 2>&1; then
+      log "按 feed 版本安装 toolchain: $FEED_VER"
+      rustup toolchain install "$FEED_VER" --profile minimal >>"$REPORT" 2>&1 || true
+    fi
+    # 无论是不是刚装的，都要确认这个 toolchain 上有目标平台的 std
+    rustup target add --toolchain "$FEED_VER" "$RUST_TARGET" >>"$REPORT" 2>&1 || true
+    PIN_ROOT=$(rustup run "$FEED_VER" rustc --print sysroot 2>/dev/null || true)
+    if [ -n "$PIN_ROOT" ] && [ -d "$PIN_ROOT/lib/rustlib/$RUST_TARGET/lib" ] \
+       && [ -x "$PIN_ROOT/bin/rustc" ]; then
+      RUST_TOOLCHAIN=$FEED_VER
+      RUST_ROOT=$PIN_ROOT
+      PIN_OK=1
+      log "已切到 feed 版本: rustc $("$RUST_ROOT/bin/rustc" --version 2>&1)"
+    fi
+    [ "$PIN_OK" = 1 ] || warn "Rust: $FEED_VER 不可用（或没有 $RUST_TARGET 的 std），继续用 runner 的 $RUST_TOOLCHAIN"
+  fi
+fi
+
+# ---------------------------------------------------------------
 # 4.5 纠正 staging_dir 里那三个「指向上次 runner」的符号链接
 #
 #   场景：构建缓存命中 → staging_dir/host/bin/rustc 是上一次运行留下的
@@ -139,6 +172,27 @@ for d in "$PWD/staging_dir/host/bin" "$PWD/staging_dir/hostpkg/bin"; do
 done
 if [ "$LINKED" -gt 0 ]; then
   log "已纠正 $LINKED 个 staging_dir 里的 rust 符号链接（缓存恢复的残留）"
+fi
+
+# ---------------------------------------------------------------
+# 4.6 版本对照：feed 期望的 rustc vs runner 实际提供的
+#
+#   这里用的是 runner 预装的 stable（省 30~60 分钟自举），代价是版本
+#   不一定等于 feeds/packages/lang/rust 里 pin 的那个。
+#
+#   功能上是等价的（产出的都是 aarch64-musl 目标代码，链接 OpenWrt 自己的
+#   musl），差别在：
+#     - codegen 随 rustc 版本变化 → 同一份源码在不同时间跑，产物不完全相同
+#     - 极少数 crate 在新版 rustc 上会报错（版本相关，不是静默错误）
+#   把两个版本号并排打在日志里，出问题时一眼能判断是不是版本引起的。
+# ---------------------------------------------------------------
+FEED_RUST_VER=$(sed -n 's/^PKG_VERSION:=//p' "$RUST_FEED/Makefile" 2>/dev/null | head -1 | tr -d ' \r')
+RUNNER_RUST_VER=$("$RUST_ROOT/bin/rustc" --version 2>/dev/null | awk '{print $2}')
+log "rustc 版本：feed 期望 ${FEED_RUST_VER:-未知} ｜ 实际使用 ${RUNNER_RUST_VER:-未知}"
+if [ -n "${FEED_RUST_VER:-}" ] && [ -n "${RUNNER_RUST_VER:-}" ] \
+   && [ "$FEED_RUST_VER" != "$RUNNER_RUST_VER" ]; then
+  log "  两者不同属正常（这就是省下 30~60 分钟的原因）；若 rust 包编译报版本相关错误，"
+  log "  把 workflow 的 RUST_PIN_FEED 设为 1，会按 feed 的版本另装一个 toolchain。"
 fi
 
 # ---------------------------------------------------------------

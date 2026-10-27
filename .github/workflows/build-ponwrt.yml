@@ -20,6 +20,10 @@ env:
   USE_DL_CACHE: true
   USE_CCACHE: false
 
+  # 用 runner 预装的 rust stable（0 秒）还是按 feed 里 pin 的版本另装一个
+  # （1~3 分钟）。默认 false：功能等价、省时间；要求产物可复现时改 true。
+  RUST_PIN_FEED: false
+
   # =========================================================
   # 整体构建缓存 —— 移植自 VIKINGYFY/OpenWRT-CI 的滚动缓存
   #
