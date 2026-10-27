@@ -232,6 +232,21 @@ pack)
     echo "::warning::staging_dir 里没有 $want —— 缓存不完整，下次该栈会重新编译"
   done
 
+  # ---------------------------------------------------------------
+  # stamp 数量校验：没有 .built 就等于白命中
+  #
+  #   现象：日志显示 Cache restored successfully，随后
+  #   Compile the firmware 里仍然 make[3] -C tools/... compile 全跑一遍。
+  #   原因就是缓存里只有 staging_dir 的产物、没有 build_dir 的 .built。
+  #   这里直接数出来，别等到下次构建才发现。
+  # ---------------------------------------------------------------
+  NBUILT=$(grep -c '\.built$' "$LIST" || true)
+  echo "host 侧 .built stamp: ${NBUILT} 个"
+  if [ "${NBUILT:-0}" -eq 0 ]; then
+    echo "::warning::清单里没有任何 .built —— 恢复后 make 会从头重编工具链，缓存等于白命中"
+    echo "::warning::检查 build_dir/{host,hostpkg,target-*/host} 是否存在；若刚 make clean 过需重编一次"
+  fi
+
   # 体积预估：zstd 对这类内容约 3 倍压缩比
   RAW_MB=0
   if command -v du >/dev/null 2>&1; then
@@ -297,6 +312,18 @@ unpack)
 
   echo "unpacked=true" >> "${GITHUB_OUTPUT:-/dev/null}"
   echo "✅ staging_dir 已从缓存恢复（stamp 已刷新）"
+
+  # 恢复了多少 host 侧 stamp —— 为 0 说明这份缓存是「白命中」的旧格式
+  N=0
+  for base in build_dir/host build_dir/hostpkg build_dir/target-*/host; do
+    [ -d "$base" ] || continue
+    N=$(( N + $(find "$base" -maxdepth 2 -type f -name '.built' 2>/dev/null | wc -l) ))
+  done
+  echo "已恢复 host 侧 .built stamp: ${N} 个"
+  if [ "$N" -eq 0 ]; then
+    echo "::warning::这份缓存不含 .built —— make 会从头重编工具链（缓存白命中）"
+    echo "::warning::请重跑一次 warm-cache.yml 重建缓存"
+  fi
   ;;
 
 # ---------------------------------------------------------------
