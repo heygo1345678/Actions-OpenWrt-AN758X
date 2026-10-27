@@ -97,7 +97,7 @@ jobs:
         continue-on-error: true
         uses: actions/create-github-app-token@v3
         with:
-          client-id: ${{ vars.PRIVATE_SOURCE_APP_CLIENT_ID }}
+          app-id: ${{ secrets.PRIVATE_SOURCE_APP_ID }}
           private-key: ${{ secrets.PRIVATE_SOURCE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
