@@ -121,6 +121,22 @@ jobs:
       #   很可能是「精确 key 匹配却仍报 not found」的直接原因
       #   （主流程能命中，保活却一直 miss，差别就在这里）。
       # =========================================================
+      # =========================================================
+      # ★ 第六种尝试：本 job 之前【完全没有 checkout】。
+      #
+      #   这是与主流程唯一剩下的结构性差异 —— 主流程所有 cache 步骤
+      #   都在 checkout 之后跑，且每次都命中。
+      #   actions/cache 内部要解析仓库/API 上下文，在没有 workspace、
+      #   没有 .git 的 job 里行为可能不同。
+      #
+      #   加上 checkout 再试一次。如果仍 miss，就别再折腾了 ——
+      #   见 README 的结论：这个流程本就可有可无。
+      # =========================================================
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
       - name: Prepare path
         run: |
           mkdir -p /tmp/keepalive
