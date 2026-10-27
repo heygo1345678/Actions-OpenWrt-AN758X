@@ -19,16 +19,21 @@ env:
   UPLOAD_RELEASE: ${{ github.event.inputs.upload_release || 'true' }}
   USE_DL_CACHE: true
   USE_CCACHE: false
-  # ★ 整体构建缓存（staging_dir）—— 参照 VIKINGYFY/OpenWRT-CI
-  #   缓存整个 staging_dir：host 工具 + 交叉编译器 + hostpkg 的 Go + target-*/host 的 Rust。
-  #   由 warm-cache.yml 生产；本流程只消费。关掉即退回全程现场编译。
-  #   ⚠ 用 '== true/false' 显式兜底，不用 '||'：GitHub 表达式里非空串即真，
-  #     'false' 不会被判为假；repository_dispatch 下 inputs 为 null 也要有确定值。
-  USE_STAGING_CACHE: ${{ github.event.inputs.use_staging_cache == 'false' && 'false' || 'true' }}
-  # actions/cache 的 with.path 不接受 GITHUB_ENV 动态值，必须是 workflow 级静态
-  STAGING_CACHE_DIR: /workdir/staging-cache
-  # 除 actions/cache 外，是否再试 Release 备份（7 天淘汰规则的长期兜底）
-  STAGING_RELEASE_BACKUP: ${{ github.event.inputs.staging_release_backup == 'false' && 'false' || 'true' }}
+
+  # =========================================================
+  # 整体构建缓存 —— 移植自 VIKINGYFY/OpenWRT-CI 的滚动缓存
+  #
+  #   一份缓存 = staging_dir/host* + staging_dir/tool* + .ccache
+  #   key       = ponwrt-<源站>-<分支>-<SoC>-<上游提交号>
+  #   回退键   = ponwrt-<源站>-<分支>-<SoC>-
+  #
+  #   ★ 关键在于 key 里【只有】提交号会变，前缀永远稳定：
+  #     上游一提交就换一代，恢复时靠前缀回退总能拿到最近一代，
+  #     所以「有没有命中」不再取决于我们自己算的指纹能不能对上。
+  #     以前那套 md5 指纹 + 精确匹配 + Release 兜底已经整个拿掉了。
+  # =========================================================
+  # actions/cache 的 with.path 不接受 GITHUB_ENV 动态值，必须 workflow 级静态
+  CACHE_ROOT: /workdir/openwrt
   TZ: Asia/Shanghai
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REPO_BRANCH: ${{ github.event.inputs.branch || 'master' }}
@@ -152,7 +157,7 @@ on:
           - firmware
           - toolchain-only
       ignore_cache:
-        description: '忽略工具链缓存强制重编'
+        description: '忽略构建缓存强制重编（跳过一次恢复，仍会存新一代）'
         required: false
         default: 'false'
         type: choice
@@ -192,25 +197,6 @@ on:
         options:
           - 'false'
           - 'true'
-      # ---------- 整体构建缓存（★ 本次新增）----------
-      # choice + 字符串，不用 boolean：本 workflow 可被 repository_dispatch
-      # 触发，那种触发下 boolean 输入拿不到值会退化成空串。
-      use_staging_cache:
-        description: '使用 staging_dir 整体缓存（关 = 全程现场编译；缓存由 warm-cache.yml 生成）'
-        required: false
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
-      staging_release_backup:
-        description: 'staging 缓存也从 Release 恢复（actions/cache 7 天未命中会淘汰，Release 不会）'
-        required: false
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
 
 # 最小权限：发布阶段需要 contents: write；清理阶段需要 actions: read/write
 permissions:
@@ -223,6 +209,11 @@ jobs:
     # 350 分钟接近 GitHub-hosted 6 小时上限；首次冷构建（工具链+全量 kmod）
     # 在 4 核 16G runner 上可能超时，建议拆出 toolchain-only 预热 job。
     timeout-minutes: 350
+
+    # 传给 cache-rollover：它只负责删旧代，不重新算 key
+    outputs:
+      cache_prefix: ${{ steps.cache-key.outputs.prefix }}
+      cache_key: ${{ steps.cache-key.outputs.key }}
 
     # ⚠ secrets 上下文不允许出现在 step 级 if 里（GitHub 的上下文可用性表
     #   没给 steps.if 这一项，写了会直接报 Unrecognized named-value: 'secrets'）。
@@ -356,6 +347,67 @@ jobs:
           echo "OPT_CRYPTO_EIP93=${OPT_CRYPTO_EIP93}" >> "$GITHUB_ENV"
 
           cd openwrt && echo "commit: $(git rev-parse --short HEAD)"
+          # .ccache 目录先建出来：actions/cache 对「path 不存在」的条目会跳过，
+          # 建个空目录让路径始终有效（USE_CCACHE=false 时它就一直空着）
+          mkdir -p .ccache
+
+      # =========================================================
+      # 2.1 构建缓存：算 key（移植自 OpenWRT-CI）
+      #
+      #   key = ponwrt-<源站>-<分支>-<SoC>-<上游提交号>
+      #   前缀只由「源站 + 分支 + SoC」决定，机型不进前缀 ——
+      #   同一 SoC 下所有机型共用一份 host/toolchain 缓存。
+      # =========================================================
+      - name: Compute cache key
+        id: cache-key
+        run: |
+          S="$GITHUB_WORKSPACE/scripts/pwrt-cache.sh"
+          [ -f "$S" ] || { echo "::error::缺 $S"; exit 1; }
+          dos2unix "$S" 2>/dev/null || true
+          chmod +x "$S"
+          bash "$S" key "$CACHE_ROOT"
+
+      # =========================================================
+      # 2.2 构建缓存：恢复
+      #
+      #   ★ 这是整套加速的核心，两个细节不能改：
+      #     key          精确的「前缀+提交号」
+      #     restore-keys 前缀 + "-"，靠它回退到最近一代
+      #   只有 restore-keys 存在，才会出现「提交号变了但依然命中上一代」，
+      #   也就是缓存永远有效、且随每次构建自动向前滚动。
+      #
+      #   ⚠ path 用通配：host* 同时覆盖 host 与 hostpkg（go / python 在这），
+      #     tool* 覆盖 toolchain-<board>_<subtarget>。
+      #     不缓存 staging_dir/target-*：那是固件包安装产物，每次都要重来。
+      # =========================================================
+      - name: Restore build cache
+        id: cache-restore
+        if: env.IGNORE_CACHE != 'true'
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ steps.cache-key.outputs.key }}
+          restore-keys: ${{ steps.cache-key.outputs.prefix }}-
+          path: |
+            ${{ env.CACHE_ROOT }}/.ccache
+            ${{ env.CACHE_ROOT }}/staging_dir/host*
+            ${{ env.CACHE_ROOT }}/staging_dir/tool*
+
+      # =========================================================
+      # 2.3 恢复之后：让 make 认账
+      #
+      #   刷新非 target 的 stamp + 写 tmp/.build。
+      #   漏了这一步，make 会因为「源码树比产物新」把工具链重编一遍，
+      #   日志却显示 Cache restored successfully —— 白命中。
+      # =========================================================
+      - name: Prepare restored build cache
+        if: env.IGNORE_CACHE != 'true' && steps.cache-restore.outputs.cache-matched-key != ''
+        env:
+          RESTORED_FROM: ${{ steps.cache-restore.outputs.cache-matched-key }}
+        run: |
+          cd "$CACHE_ROOT"
+          echo "恢复自: $RESTORED_FROM"
+          echo "精确命中: ${{ steps.cache-restore.outputs.cache-hit }}"
+          bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" prepare "$CACHE_ROOT"
 
       # =========================================================
       # 2.5 私有仓库凭证（openwrt-fttr feed 的来源）
@@ -706,7 +758,7 @@ jobs:
           echo "WANT_EIP93=${OPT_CRYPTO_EIP93}"     >> "$GITHUB_ENV"
 
       # =========================================================
-      # 9. defconfig + 生成工具链缓存 Key + 校验机型
+      # 9. defconfig + 校验机型
       #     【唯一一次 defconfig】后续步骤不再调用，避免 .config 被重新展开、
       #     机型配置里显式写死的选择被静默剔除
       # =========================================================
@@ -742,8 +794,18 @@ jobs:
           bash "$S" "$BUILD_ROOT/openwrt"
 
 
-      - name: Generate toolchain cache key
-        id: cache-key
+      # =========================================================
+      # 9. defconfig + 配置校验
+      #
+      #    【唯一一次 defconfig】后续步骤不再调用，避免 .config 被重新展开、
+      #    机型配置里显式写死的选择被静默剔除。
+      #
+      #    ★ 这里不再算缓存 key 了 —— key 在 2.1 就算好（提交号 + 前缀），
+      #      恢复缓存在 2.2 也已经做完。缓存与 .config 彻底解耦，
+      #      配置怎么改都不会让缓存失效，这正是移植过来的那套的关键。
+      # =========================================================
+      - name: Validate configuration
+        id: validate
         run: |
           cd "$BUILD_ROOT/openwrt"
 
@@ -837,53 +899,18 @@ jobs:
             echo "机型校验通过: ${PROFILE}"
           fi
 
-          TARGET=$(grep '^CONFIG_TARGET_BOARD=' .config | cut -d'"' -f2)
-          SUBTARGET=$(grep '^CONFIG_TARGET_SUBTARGET=' .config | cut -d'"' -f2)
-
-          TOOLS_HASH=$(find tools toolchain -type f \( -name "Makefile" -o -name "*.mk" \) \
-            -exec md5sum {} + 2>/dev/null | sort | md5sum | cut -d' ' -f1)
-
-          CACHE_KEY="ponwrt-toolchain-${TARGET}-${SUBTARGET}-${TOOLS_HASH:0:16}"
-          CACHE_PREFIX="ponwrt-toolchain-${TARGET}-${SUBTARGET}"
-
-          echo "CACHE_KEY=$CACHE_KEY"     >> "$GITHUB_OUTPUT"
-          echo "CACHE_PREFIX=$CACHE_PREFIX" >> "$GITHUB_OUTPUT"
-          echo "========================================"
-          echo "缓存 Key  : $CACHE_KEY"
-          echo "缓存前缀  : $CACHE_PREFIX"
-          echo "========================================"
+          echo "CONFIG_TARGET_BOARD=$(grep '^CONFIG_TARGET_BOARD=' .config | cut -d'"' -f2)"
+          echo "CONFIG_TARGET_SUBTARGET=$(grep '^CONFIG_TARGET_SUBTARGET=' .config | cut -d'"' -f2)"
 
       # =========================================================
-      # 9.1 生成整体构建缓存指纹
-      #
-      #   ★ 必须在步骤 9 之后：要读 defconfig 展开后的 .config。
-      #
-      #   指纹 = 上游提交 + 最终配置 + feeds + 自定义包/脚本 + runner 架构。
-      #   任一变化都换 key —— 这是 OpenWRT-CI 那套「指纹一致才整体复用」的核心。
-      #   脚本没入仓时只 warning 跳过，绝不让构建死在 chmod 上。
-      # =========================================================
-      - name: Generate build cache fingerprint
-        id: fp
-        if: env.USE_STAGING_CACHE == 'true'
-        run: |
-          cd "$BUILD_ROOT/openwrt"
-          SCRIPT="$GITHUB_WORKSPACE/scripts/pwrt-cache.sh"
-          if [ ! -f "$SCRIPT" ]; then
-            echo "::warning::缺 $SCRIPT，本次跳过整体构建缓存（走常规编译）"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          dos2unix "$SCRIPT" 2>/dev/null || true
-          chmod +x "$SCRIPT"
-          bash "$SCRIPT" fingerprint "$BUILD_ROOT/openwrt"
-
-      
-      # =========================================================
-      # 9.5 下载工具链源码 —— 必须在编工具链之前
+      # 9.5 下载工具链源码 —— 只在缓存没恢复出工具链时才需要
       #     报错 "Can't open dl/musl-1.2.6.tar.gz" 就是这一步缺失导致的：
       #     make toolchain/install 不会自动补下载，只会去解压 dl 里已有的包
       # =========================================================
       - name: Download toolchain sources
+        if: >-
+          env.IGNORE_CACHE == 'true'
+          || steps.cache-restore.outputs.cache-matched-key == ''
         run: |
           cd "$BUILD_ROOT/openwrt"
 
@@ -919,161 +946,63 @@ jobs:
           echo "✅ 工具链源码校验通过"
 
       # =========================================================
-      # 10. 恢复工具链 —— 第一优先 actions/cache
-      # =========================================================
-      - name: Restore toolchain from actions/cache
-        if: env.IGNORE_CACHE != 'true'
-        uses: actions/cache/restore@v5
-        id: cache-restore
-        with:
-          path: |
-            ${{ env.BUILD_ROOT }}/openwrt/staging_dir/host*
-            ${{ env.BUILD_ROOT }}/openwrt/staging_dir/tool*
-          key: ${{ steps.cache-key.outputs.CACHE_KEY }}
-
-      # =========================================================
-      # 11. 恢复工具链 —— 第二优先 Release 备份
-      # =========================================================
-      - name: Restore toolchain from Release backup
-        if: env.IGNORE_CACHE != 'true' && steps.cache-restore.outputs.cache-hit != 'true'
-        id: release-restore
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cd "$BUILD_ROOT/openwrt"
-
-          CACHE_KEY="${{ steps.cache-key.outputs.CACHE_KEY }}"
-          ASSET_NAME="${CACHE_KEY}.tzst"
-
-          if ! gh release view toolchain-cache --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "restored=false" >> "$GITHUB_OUTPUT"
-            echo "toolchain-cache Release 不存在，首次运行"
-            exit 0
-          fi
-
-          # tzst 需要 unzstd；runner 未预装时先装，避免「假命中」后解压失败
-          which unzstd >/dev/null 2>&1 || sudo -E apt-get -yqq install zstd >/dev/null 2>&1 || true
-
-          if gh release view toolchain-cache --repo "$GITHUB_REPOSITORY" \
-               --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ASSET_NAME"; then
-            echo "从 Release 下载工具链: $ASSET_NAME"
-            gh release download toolchain-cache --repo "$GITHUB_REPOSITORY" -p "$ASSET_NAME" -D .
-            tar -I unzstd -xf "$ASSET_NAME" || tar -xf "$ASSET_NAME"
-            rm -f "$ASSET_NAME"
-            echo "restored=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "restored=false" >> "$GITHUB_OUTPUT"
-            echo "Release 中无匹配缓存"
-          fi
-
-      # =========================================================
-      # 12. 处理工具链
-      # =========================================================
-      # =========================================================
-      # 19.1~19.3 恢复 staging_dir 整体缓存（双通道）
+      # 10. 编译工具链 —— 只在缓存没给出工具链时才动手
       #
-      #   actions/cache（快，但 7 天未命中即淘汰）→ Release（长期兜底）
-      #   → 解压 + touch 全部 stamp。
+      #   ★ 与 OpenWRT-CI 一致：判断依据只有一个 —— 2.2 那步拿到的
+      #     cache-matched-key。命中（哪怕只是前缀回退命中）就整段跳过；
+      #     没命中才编，编完由后面的 Save build cache 存成新一代。
       #
-      #   ★ touch 是关键：OpenWrt 靠 mtime 判断依赖，tar 还原的是旧 mtime，
-      #     而源码树刚 clone（mtime 是现在）。不 touch 的话 make 认为
-      #     「源码比产物新」从而全部重编，缓存等于白命中。
+      #   ⚠ 以前是按「指纹是否相等」来判断的：那套逻辑里两端算不齐
+      #     就等于永远冷编译，而且没有任何自愈路径 —— 每次都在
+      #     "Cache not found" 之后完整重编 1~1.5 小时。
       # =========================================================
-      - name: Restore staging from actions/cache
-        id: staging-restore
-        if: >-
-          env.USE_STAGING_CACHE == 'true'
-          && env.IGNORE_CACHE != 'true'
-          && steps.fp.outputs.skip != 'true'
-        uses: actions/cache/restore@v5
-        continue-on-error: true
-        with:
-          path: /workdir/staging-cache
-          # ⚠ 不做前缀回退：指纹变了说明内容已变，用旧的是错的
-          key: ${{ steps.fp.outputs.STAGING_KEY }}
-
-      - name: Restore staging from Release backup
-        id: staging-release-restore
-        if: >-
-          env.USE_STAGING_CACHE == 'true'
-          && env.IGNORE_CACHE != 'true'
-          && env.STAGING_RELEASE_BACKUP == 'true'
-          && steps.fp.outputs.skip != 'true'
-          && steps.staging-restore.outputs.cache-hit != 'true'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p "$STAGING_CACHE_DIR"
-          KEY='${{ steps.fp.outputs.STAGING_KEY }}'
-          [ -z "$KEY" ] && { echo "restored=false" >> "$GITHUB_OUTPUT"; exit 0; }
-          ASSET="${KEY}.tzst"
-          if gh release view staging-cache --repo "$GITHUB_REPOSITORY" \
-               --json assets -q '.assets[].name' 2>/dev/null | grep -qx "$ASSET"; then
-            gh release download staging-cache --repo "$GITHUB_REPOSITORY" -p "$ASSET" -D "$STAGING_CACHE_DIR"
-            echo "restored=true" >> "$GITHUB_OUTPUT"
-            echo "✅ 已从 Release 下载 staging 缓存: $ASSET"
-          else
-            echo "restored=false" >> "$GITHUB_OUTPUT"
-            echo "Release 中无匹配的 staging 缓存"
-          fi
-
-      - name: Unpack staging dir
-        id: staging-unpack
-        if: >-
-          env.USE_STAGING_CACHE == 'true'
-          && env.IGNORE_CACHE != 'true'
-          && steps.fp.outputs.skip != 'true'
-        run: |
-          cd "$BUILD_ROOT/openwrt"
-          STAGING_KEY='${{ steps.fp.outputs.STAGING_KEY }}' \
-          STAGING_CACHE_DIR="$STAGING_CACHE_DIR" \
-            bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" unpack "$BUILD_ROOT/openwrt"
-
-      
-      - name: Handle toolchain
+      - name: Build tools & toolchain
         id: toolchain
+        if: >-
+          env.IGNORE_CACHE == 'true'
+          || steps.cache-restore.outputs.cache-matched-key == ''
         run: |
           cd "$BUILD_ROOT/openwrt"
 
-          # ★ staging_dir 整体缓存命中 → host 工具链、交叉编译器、
-          #   golang / rustc 全在里面，一步都不用编。
-          if [ "${{ steps.staging-unpack.outputs.unpacked }}" = "true" ]; then
-            echo "✅ staging_dir 整体缓存命中，跳过 tools / toolchain 编译"
-            echo "need_build=false"        >> "$GITHUB_OUTPUT"
-            echo "need_save_cache=false"   >> "$GITHUB_OUTPUT"
-            echo "need_save_release=false" >> "$GITHUB_OUTPUT"
-            touch toolchain/stamp-compile tools/stamp-compile 2>/dev/null || true
-            exit 0
-          fi
+          make tools/install -j"$(nproc)" || make tools/install -j1 V=s || {
+            echo "::error::tools 编译失败"; exit 1; }
+          make toolchain/install -j"$(nproc)" || make toolchain/install -j1 V=s || {
+            echo "::error::toolchain 编译失败"; exit 1; }
 
-          CACHE_HIT="${{ steps.cache-restore.outputs.cache-hit }}"
-          RELEASE_HIT="${{ steps.release-restore.outputs.restored }}"
-          [ "$IGNORE_CACHE" = "true" ] && CACHE_HIT="" && RELEASE_HIT=""
-
-          if [ "$CACHE_HIT" = "true" ]; then
-            echo "actions/cache 命中，跳过工具链编译"
-            echo "need_build=false"       >> "$GITHUB_OUTPUT"
-            echo "need_save_cache=false"  >> "$GITHUB_OUTPUT"
-            echo "need_save_release=false" >> "$GITHUB_OUTPUT"
-          elif [ "$RELEASE_HIT" = "true" ]; then
-            echo "Release 缓存命中，回写 actions/cache"
-            echo "need_build=false"       >> "$GITHUB_OUTPUT"
-            echo "need_save_cache=true"   >> "$GITHUB_OUTPUT"
-            echo "need_save_release=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "无可用缓存，开始编译工具链..."
-            make tools/install -j"$(nproc)" || make tools/install -j1 V=s || { echo "tools 编译失败"; exit 1; }
-            make toolchain/install -j"$(nproc)" || make toolchain/install -j1 V=s || { echo "toolchain 编译失败"; exit 1; }
-            echo "need_build=true"        >> "$GITHUB_OUTPUT"
-            echo "need_save_cache=true"   >> "$GITHUB_OUTPUT"
-            echo "need_save_release=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          # 后续 make 跳过工具链重编：touch 对应 stamp 而非 sed 改写 Makefile，
-          # 避免上游调整缩进/换行后失效、并避免污染工作区。
+          # 让后续 make 认账：touch stamp，而不是 sed 改写 Makefile
+          # （改 Makefile 会在上游调整缩进后失效，还会污染工作区）
           touch toolchain/stamp-compile tools/stamp-compile 2>/dev/null || true
+          mkdir -p tmp && echo 1 > tmp/.build
+
+      # =========================================================
+      # 10.1 缓存决策写进 Summary —— 命中与否一眼可见
+      # =========================================================
+      - name: Cache decision
+        run: |
+          HIT='${{ steps.cache-restore.outputs.cache-hit }}'
+          MATCHED='${{ steps.cache-restore.outputs.cache-matched-key }}'
+          if [ "${IGNORE_CACHE}" = "true" ]; then
+            DECISION="ignore_cache=true，按要求跳过恢复、强制重编"
+          elif [ -z "$MATCHED" ]; then
+            DECISION="无可用缓存，冷编译（本次会存第一代）"
+          elif [ "$HIT" = "true" ]; then
+            DECISION="精确命中，工具链一步没编"
+          else
+            DECISION="前缀回退命中上一代，工具链没编；本次存新一代"
+          fi
+
+          {
+            echo "### 构建缓存"
+            echo ""
+            echo "- 决定：${DECISION}"
+            echo "- key：\`${{ steps.cache-key.outputs.key }}\`"
+            if [ -n "$MATCHED" ]; then echo "- 实际恢复自：\`${MATCHED}\`"; fi
+            echo "- 恢复出工具链：$([ "${{ steps.toolchain.outcome }}" = "skipped" ] && echo '是' || echo '否')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "key      : ${{ steps.cache-key.outputs.key }}"
+          echo "命中     : ${HIT:-false} / matched=${MATCHED:-none}"
+          echo "编译工具链: ${{ steps.toolchain.outcome }}"
 
       # =========================================================
       # 12.5 ccache 补装（仅 USE_CCACHE=true 时执行）
@@ -1120,62 +1049,6 @@ jobs:
             echo "::warning::ccache 二进制仍缺失，强制关闭"
             sed -i 's/^CONFIG_CCACHE=y/# CONFIG_CCACHE is not set/' .config
           fi
-
-      # =========================================================
-      # 13. 保存工具链到 actions/cache
-      # =========================================================
-      - name: Save toolchain to actions/cache
-        uses: actions/cache/save@v5
-        if: steps.toolchain.outputs.need_save_cache == 'true'
-        # 即使固件编译失败也要保住工具链，避免下次冷启动
-        continue-on-error: true
-        with:
-          path: |
-            ${{ env.BUILD_ROOT }}/openwrt/staging_dir/host*
-            ${{ env.BUILD_ROOT }}/openwrt/staging_dir/tool*
-          key: ${{ steps.cache-key.outputs.CACHE_KEY }}
-
-      # =========================================================
-      # 14. 保存工具链到 Release 备份
-      # =========================================================
-      - name: Save toolchain to Release backup
-        if: steps.toolchain.outputs.need_save_release == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cd "$BUILD_ROOT/openwrt"
-
-          CACHE_KEY="${{ steps.cache-key.outputs.CACHE_KEY }}"
-          CACHE_PREFIX="${{ steps.cache-key.outputs.CACHE_PREFIX }}"
-
-          tar -I zstdmt -cf "${CACHE_KEY}.tzst" staging_dir/host* staging_dir/tool*
-          ls -lh "${CACHE_KEY}.tzst"
-
-          gh release view toolchain-cache --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create toolchain-cache --repo "$GITHUB_REPOSITORY" \
-              --title "Toolchain Cache" --notes "自动生成的工具链缓存，请勿手动删除" --latest=false
-
-          # 删除同平台旧缓存
-          gh release view toolchain-cache --repo "$GITHUB_REPOSITORY" --json assets \
-            -q '.assets[].name' 2>/dev/null | grep "^${CACHE_PREFIX}" | while read -r old; do
-              gh release delete-asset toolchain-cache "$old" --repo "$GITHUB_REPOSITORY" -y 2>/dev/null || true
-            done
-
-          gh release upload toolchain-cache "${CACHE_KEY}.tzst" --repo "$GITHUB_REPOSITORY" --clobber
-          rm -f "${CACHE_KEY}.tzst"
-
-      # =========================================================
-      # 15. ccache 缓存
-      # =========================================================
-      - name: Cache ccache
-        if: env.USE_CCACHE == 'true' && env.BUILD_SCOPE != 'toolchain-only'
-        uses: actions/cache@v5
-        continue-on-error: true
-        with:
-          path: ${{ env.BUILD_ROOT }}/openwrt/.ccache
-          key: ponwrt-ccache-${{ env.SOC }}-${{ steps.resolve.outputs.week }}
-          restore-keys: |
-            ponwrt-ccache-${{ env.SOC }}-
 
       # =========================================================
       # 16. SSH 调试（仅受控场景开启）
@@ -1238,6 +1111,33 @@ jobs:
           df -hT /
           echo "status=success" >> "$GITHUB_OUTPUT"
           echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> "$GITHUB_ENV"
+
+      # =========================================================
+      # 18.5 存新一代缓存 —— 移植自 OpenWRT-CI 的 Save Build Cache
+      #
+      #   三条判断，缺一不可：
+      #     success()                        编译过的东西才可信
+      #     cache-hit != true                精确命中说明内容没变，不用重存
+      #                                       （前缀回退命中【要】存：那一代已经旧了，
+      #                                         这就是缓存「自动向前滚动」的动作）
+      #     compile/toolchain 至少一个成功  toolchain-only 预热的运行也要存
+      #
+      #   ⚠ 同 key 已存在时 save 会报 "already exists"，属正常，
+      #     continue-on-error 兜住，不影响构建结论。
+      # =========================================================
+      - name: Save build cache
+        if: >-
+          success()
+          && steps.cache-restore.outputs.cache-hit != 'true'
+          && (steps.compile.outcome == 'success' || steps.toolchain.outcome == 'success')
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          key: ${{ steps.cache-key.outputs.key }}
+          path: |
+            ${{ env.CACHE_ROOT }}/.ccache
+            ${{ env.CACHE_ROOT }}/staging_dir/host*
+            ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
       # =========================================================
       # 19. 空间检查
@@ -1368,3 +1268,41 @@ jobs:
           delete_tag_pattern: '^${{ env.DEVICE_NAME }}-'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # =========================================================
+  # 缓存轮换 —— 移植自 OpenWRT-CI 的 cache-rollover job
+  #
+  #   每次构建都换一代 key（提交号变了），旧代再也没人用却一直占着
+  #   actions/cache 的 10GB 配额。这个 job 只保留当前这一代。
+  #
+  #   单独成 job 而不是并进 build，原因和上游一致：
+  #     - 它必须有 concurrency，避免两个构建同时跑时互相删掉对方刚存的
+  #     - 它失败不该影响构建结论
+  #   脚本内部还会先确认「当前 key 已在缓存里」再删，
+  #   避免把唯一一份删掉（save 落库有秒级延迟）。
+  # =========================================================
+  cache-rollover:
+    name: Roll build cache
+    needs: build
+    # 只在构建成功、且确实存过缓存时才轮换
+    if: ${{ needs.build.result == 'success' && needs.build.outputs.cache_key != '' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ponwrt-cache-rollover-${{ github.ref }}-${{ needs.build.outputs.cache_prefix }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PREFIX: ${{ needs.build.outputs.cache_prefix }}
+      KEY: ${{ needs.build.outputs.cache_key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Roll cache generations
+        continue-on-error: true
+        run: |
+          S="$GITHUB_WORKSPACE/scripts/pwrt-cache.sh"
+          dos2unix "$S" 2>/dev/null || true
+          bash "$S" rollover

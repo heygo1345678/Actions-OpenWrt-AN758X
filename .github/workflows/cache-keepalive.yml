@@ -1,49 +1,43 @@
 name: Keep Build Caches Alive
 
 # =========================================================
-# actions/cache 的条目 7 天不访问会被回收。
-# 本流程定期 touch 一次各类缓存，保证常用机型不用每次重编。
+# actions/cache 的条目 7 天没人访问就会被回收。
 #
-# ⚠ 改过两版，前两版都不生效（原因见各步骤注释）。现在这一版用
-#   「先枚举出精确 key，再逐个 restore」的方式，不依赖 prefix 回退。
+#   移植 OpenWRT-CI 的滚动缓存之后，「访问」这件事有了更省的做法：
+#   缓存是目录形态、key 是「前缀+提交号」，所以只要按前缀把最新那一代
+#   真恢复一次，就算访问过（同时顺带验证了这份缓存在不在、能不能解开）。
+#
+#   ⚠ 不做 lookup-only：实测那条路径既不能可靠命中，也不一定刷新
+#     lastAccessedAt —— 两个目的都落空。这里一律用真实 restore。
+#
+#   ⚠ 也【不用】前缀回退去猜：先把实际存在的 key 列出来，
+#     再逐个按精确 key 恢复。能命中就一定能看到，命中不了也看得见。
 # =========================================================
 
 on:
   schedule:
-    # 每 3 天一次。staging 只被 warm-cache.yml 每周一访问一次，
-    # 正好擦 7 天的边；schedule 稍有延迟就会超期，所以这里更频繁些。
+    # 每 3 天一次：主流程与 warm-cache 都不一定每周跑，
+    # 卡在 7 天线边缘容易被回收
     - cron: '0 0 */3 * *'
   workflow_dispatch:
     inputs:
-      verbose:
-        description: '打印全部缓存条目（含大小、上次访问时间）'
+      dry_run:
+        description: '只列出缓存，不做恢复'
         required: false
-        default: 'true'
+        default: 'false'
         type: choice
         options:
-          - 'true'
           - 'false'
+          - 'true'
 
 permissions:
-  actions: read
   contents: read
+  actions: write
 
 jobs:
-  # =========================================================
-  # 第一步：把当前存在的缓存 key 全部枚举出来
-  #
-  #   为什么不能直接用 restore-keys 前缀回退：
-  #     实测日志是 "Cache not found for input keys:
-  #     keepalive-toolchain-never-match, ponwrt-toolchain-"，
-  #     而 Caches 页面里确实存在 ponwrt-toolchain-airoha-an7581-743a557e3e0b5679。
-  #     即 —— 带 lookup-only 的 restore 走前缀没能解析到已有条目。
-  #     与其继续猜语义，不如先把精确 key 列出来再逐个命中，
-  #     这是唯一能确定「真的访问到了」的做法。
-  #
-  #   ⚠ gh 必须带 -R：本 job 没有 checkout，cwd 不是 git 仓库，
-  #     gh 无法推断仓库，会报
-  #     "failed to run git: fatal: not a git repository"。
-  # =========================================================
+  # ---------------------------------------------------------
+  # 枚举：每个前缀只留「创建时间最新」的那一代
+  # ---------------------------------------------------------
   enum:
     runs-on: ubuntu-latest
     outputs:
@@ -56,143 +50,109 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # ⚠ path 目录必须存在：actions/cache 会对 path 做解析，
-          #   指向不存在的目录时行为不确定
-          mkdir -p /tmp/dummy
 
-          gh cache list -R "$GITHUB_REPOSITORY" --limit 200 --json key \
-            --jq '.[].key' > all.txt
+          gh cache list -R "$GITHUB_REPOSITORY" --limit 200 \
+            --json key,createdAt,sizeInBytes > all.json
 
-          # 只保留本项目用到的前缀
-          grep -E '^ponwrt-(staging|toolchain|dl|ccache)-' all.txt > keys.txt || true
+          echo "===== 全部 ponwrt-* 缓存 ====="
+          jq -r '.[] | select(.key | startswith("ponwrt-"))
+                 | "\(.createdAt)\t\(.sizeInBytes/1048576|floor)MB\t\(.key)"' all.json \
+            | sort -r
 
-          COUNT=$(wc -l < keys.txt || echo 0)
+          # 前缀 = key 去掉末尾的 40 位提交号
+          # 例：ponwrt-pbs05-ponwrt-master-an7581-<sha40> → ponwrt-pbs05-ponwrt-master-an7581
+          # 让脚本按这个分组取最新，避免在这里重复实现前缀算法
+          KEYS=$(jq -r '
+            [ .[] | select(.key | startswith("ponwrt-")) ]
+            | group_by(.key | sub("-[0-9a-f]{40}$"; ""))
+            | map(sort_by(.createdAt) | last | .key)
+            | .[]' all.json)
+
+          COUNT=$(printf '%s\n' "$KEYS" | grep -c . || true)
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
           if [ "$COUNT" -eq 0 ]; then
-            echo "::warning::没有查到任何 ponwrt-* 缓存 —— 检查 GITHUB_TOKEN 权限或缓存是否已建"
-            echo "keys=[]" >> "$GITHUB_OUTPUT"
+            echo "::warning::没有 ponwrt-* 缓存（还没建过，或已被全部清理）"
+            # ⚠ 矩阵不能是空数组（GitHub 会报 "Matrix must define at least one vector"），
+            #   给一个占位值，真正干活的那个 job 由 count 判断跳过
+            echo 'keys=["__none__"]' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          {
-            echo "===== 待保活的缓存条目 ($COUNT) ====="
-            cat keys.txt
-          }
+          echo "keys=$(printf '%s\n' "$KEYS" | jq -R -s 'split("\n") | map(select(length>0))' | tr -d '\n')" >> "$GITHUB_OUTPUT"
 
-          # 转成 JSON 数组供 matrix 使用
-          jq -R -s 'split("\n") | map(select(length > 0))' keys.txt > keys.json
-          echo "keys=$(cat keys.json | tr -d '\n')" >> "$GITHUB_OUTPUT"
-
-  # =========================================================
-  # 第二步：每个 key 一次精确 restore（★ 不再用 lookup-only）
+  # ---------------------------------------------------------
+  # 保活：逐个真实恢复
   #
-  #   实测现象：key 与 Caches 页面完全一致（连字符尾号都对得上），
-  #   精确匹配 + lookup-only: true 仍然报
-  #     Cache not found for input keys: ponwrt-toolchain-airoha-an7581-743a557e3e0b5679
-  #
-  #   结论：lookup-only 走的是「只查不下载」的另一条代码路径，
-  #   它既不可靠地命中，也不确定会不会刷新 lastAccessedAt ——
-  #   两个目的都没达成。前缀回退之前也被证明不生效。
-  #
-  #   所以这里改成【真实 restore】：把缓存下下来解压到临时目录。
-  #   这肯定算一次访问，命中与否也看得见。
-  #
-  #   代价：每次保活要下载约 1.8 GB（三条加起来）。
-  #   但走的是 GitHub 内网，实测几十秒，且不占 actions 分钟数之外
-  #   的任何配额。相比「缓存被淘汰后重编 1~1.5 小时」，很划算。
-  # =========================================================
+  #   ⚠ path 必须与写入时一致，且目录要在本 job 里先建好。
+  #     指向不存在的目录时，actions/cache 的行为未定义（很可能直接 miss）。
+  # ---------------------------------------------------------
   touch:
     needs: enum
-    if: needs.enum.outputs.count != '0'
+    if: needs.enum.outputs.count != '0' && github.event.inputs.dry_run != 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
         key: ${{ fromJson(needs.enum.outputs.keys) }}
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 4
     steps:
-      # =========================================================
-      # ★ path 指向的目录必须【在本 job 内】先创建。
-      #
-      #   touch 是独立 job，与 enum 不共享文件系统 ——
-      #   enum 里 mkdir 的 /tmp/dummy 在这里根本不存在。
-      #   actions/cache 对一个不存在的 path 行为未定义，
-      #   很可能是「精确 key 匹配却仍报 not found」的直接原因
-      #   （主流程能命中，保活却一直 miss，差别就在这里）。
-      # =========================================================
-      # =========================================================
-      # ★ 第六种尝试：本 job 之前【完全没有 checkout】。
-      #
-      #   这是与主流程唯一剩下的结构性差异 —— 主流程所有 cache 步骤
-      #   都在 checkout 之后跑，且每次都命中。
-      #   actions/cache 内部要解析仓库/API 上下文，在没有 workspace、
-      #   没有 .git 的 job 里行为可能不同。
-      #
-      #   加上 checkout 再试一次。如果仍 miss，就别再折腾了 ——
-      #   见 README 的结论：这个流程本就可有可无。
-      # =========================================================
       - name: Checkout
         uses: actions/checkout@v5
         with:
           persist-credentials: false
 
-      - name: Prepare path
+      - name: Prepare paths
         run: |
-          mkdir -p /tmp/keepalive
-          echo "分支: ${GITHUB_REF_NAME} / 默认分支: ${{ github.event.repository.default_branch }}"
           echo "目标 key: ${{ matrix.key }}"
+          mkdir -p /workdir/openwrt/.ccache \
+                   /workdir/openwrt/staging_dir/host \
+                   /workdir/openwrt/staging_dir/hostpkg \
+                   /workdir/openwrt/staging_dir/toolchain
 
-      - name: Touch ${{ matrix.key }}
+      - name: Restore ${{ matrix.key }}
         id: t
         uses: actions/cache/restore@v5
         continue-on-error: true
         with:
-          # 真实下载；内容丢进临时目录，job 结束即弃
-          path: /tmp/keepalive
+          path: |
+            /workdir/openwrt/.ccache
+            /workdir/openwrt/staging_dir/host*
+            /workdir/openwrt/staging_dir/tool*
           key: ${{ matrix.key }}
 
-      - name: Result ${{ matrix.key }}
+      - name: Result
         if: always()
         run: |
           HIT='${{ steps.t.outputs.cache-hit }}'
-          case "$HIT" in
-            true) echo "✅ 命中并已刷新访问时间" ;;
-            *)
-              echo "::warning::未命中。可能原因（按概率）："
-              echo "::warning::1) 缓存建在别的分支 —— actions/cache 只能读当前/上游/默认分支"
-              echo "::warning::2) key 与 Caches 页面显示的不完全一致（对比一下尾号）"
-              echo "::warning::3) 该条目已被 7 天规则回收（gh 列表有延迟）"
-              ;;
-          esac
-          du -sh /tmp/keepalive 2>/dev/null || true
+          if [ "$HIT" = "true" ]; then
+            echo "✅ 命中并已刷新访问时间"
+          else
+            echo "::warning::未命中。按概率排查："
+            echo "::warning::1) 该条目建在别的分支 —— actions/cache 只能读当前/上游/默认分支"
+            echo "::warning::2) key 与 Caches 页面不完全一致"
+            echo "::warning::3) 已被 7 天规则回收（gh 列表有延迟）"
+          fi
+          du -sh /workdir/openwrt 2>/dev/null || true
 
-  # =========================================================
-  # 第三步：验证
-  #
-  #   跑完后去 Actions → Caches 看 "Last used" 是否刷新到刚才。
-  #
-  #   如果仍然 "Cache not found"，那多半不是 key 写错，而是
-  #   【缓存作用域】问题：
-  #     actions/cache 只能读到「当前分支 / 上游分支 / 默认分支」建的缓存。
-  #     gh cache list 走的是 REST API，能看到全仓库所有分支的缓存。
-  #   所以列表里看得见、restore 时找不到，是正常的 ——
-  #   请把本 workflow 放到与建缓存相同的分支上跑（通常是默认分支）。
-  # =========================================================
+  # ---------------------------------------------------------
+  # 收尾：把当前状态打一份，方便对照
+  # ---------------------------------------------------------
   verify:
     needs: [enum, touch]
-    if: always() && github.event.inputs.verbose != 'false'
+    if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Show all caches with last-used time
+      - name: Show all caches
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "===== 全部缓存（key / 大小 / 上次访问）====="
+          echo "===== 缓存总览（按创建时间倒序）====="
           gh cache list -R "$GITHUB_REPOSITORY" --limit 200 \
-            --json key,sizeInBytes,lastAccessedAt \
-            --jq '.[] | "\(.lastAccessedAt)\t\(.sizeInBytes/1048576|floor)MB\t\(.key)"' \
-            | sort -r
+            --json key,sizeInBytes,createdAt,lastAccessedAt \
+            --jq 'sort_by(.createdAt) | reverse | .[]
+                  | "创建 \(.createdAt[0:16])  访问 \(.lastAccessedAt[0:16])  \(.sizeInBytes/1048576|floor)MB  \(.key)"'
           echo ""
-          echo "对照上面的时间：本流程刚跑过，ponwrt-* 条目的"
-          echo "Last used 应当已刷新到当前时间。"
+          echo "总占用："
+          gh cache list -R "$GITHUB_REPOSITORY" --limit 200 --json sizeInBytes \
+            --jq '([.[].sizeInBytes] | add // 0) / 1048576 | floor | "\(.) MB（配额 10240 MB）"'

@@ -1,0 +1,168 @@
+name: Cache Clean
+
+# =========================================================
+# 缓存清理 —— 对应 OpenWRT-CI 的 Cache-Clean.yml
+#
+#   上游是每周一把所有缓存删光（gh cache delete --all），
+#   因为他们每天定时编译，删掉第二天就重新生成。
+#
+#   本仓库是手动/半自动编译，全删的代价太大（下次要冷编 1~2 小时），
+#   所以这里把「删什么」做成显式选项，默认只做轮换：
+#
+#     rollover  每个前缀只留创建时间最新的一代（默认，可定时跑）
+#     all       全删（等价上游的 gh cache delete --all，慎用）
+#     prefix    只删指定前缀下的全部条目
+#
+#   ⚠ 无论哪种模式，dl 缓存（ponwrt-dl-*）都不在默认清理范围：
+#     它是纯增量下载缓存，越老越有用，删了等于白白重下几个 G。
+#     真要删请在 mode=all 时手动确认。
+# =========================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '清理模式'
+        required: true
+        default: 'rollover'
+        type: choice
+        options:
+          - rollover
+          - prefix
+          - all
+      prefix:
+        description: 'mode=prefix 时要删的前缀（如 ponwrt-pbs05-ponwrt-master-an7581）'
+        required: false
+        default: ''
+      include_dl:
+        description: '是否连 dl 缓存一起清理（默认不动 dl）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+  schedule:
+    # 每周一 04:20（UTC）做一次轮换；只删旧代，不会让缓存归零
+    - cron: '20 4 * * 1'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MODE: ${{ github.event.inputs.mode || 'rollover' }}
+      PREFIX: ${{ github.event.inputs.prefix || '' }}
+      INCLUDE_DL: ${{ github.event.inputs.include_dl || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Show before
+        run: |
+          echo "===== 清理前 ====="
+          gh cache list -R "$GITHUB_REPOSITORY" --limit 200 \
+            --json key,sizeInBytes,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[]
+                  | "\(.createdAt[0:16])  \(.sizeInBytes/1048576|floor)MB  \(.key)"'
+          gh cache list -R "$GITHUB_REPOSITORY" --limit 200 --json sizeInBytes \
+            --jq '"总占用 \(([.[].sizeInBytes] | add // 0) / 1048576 | floor) MB"'
+
+      - name: Clean
+        run: |
+          set -uo pipefail
+          DELETED=0
+          FAILED=0
+
+          del() {  # del <id> <key>
+            if gh cache delete "$1" -R "$GITHUB_REPOSITORY" 2>/dev/null; then
+              echo "  ✅ $2"
+              DELETED=$((DELETED+1))
+            else
+              echo "  ⚠️  失败 $2"
+              FAILED=$((FAILED+1))
+            fi
+          }
+
+          case "$MODE" in
+            all)
+              echo "=== 模式 all：删除全部缓存（含 dl）==="
+              gh cache list -R "$GITHUB_REPOSITORY" --limit 200 --json id,key \
+                --jq '.[] | [.id,.key] | @tsv' |
+                while IFS=$'\t' read -r id key; do
+                  [ -n "${id:-}" ] || continue
+                  gh cache delete "$id" -R "$GITHUB_REPOSITORY" 2>/dev/null \
+                    && echo "  ✅ $key" || echo "  ⚠️  $key"
+                done
+              exit 0
+              ;;
+
+            prefix)
+              [ -n "$PREFIX" ] || { echo "::error::mode=prefix 必须填 prefix"; exit 1; }
+              echo "=== 模式 prefix：删除 ${PREFIX}* ==="
+              gh cache list -R "$GITHUB_REPOSITORY" --limit 200 --key "$PREFIX" \
+                --json id,key --jq '.[] | [.id,.key] | @tsv' |
+                while IFS=$'\t' read -r id key; do
+                  [ -n "${id:-}" ] || continue
+                  gh cache delete "$id" -R "$GITHUB_REPOSITORY" 2>/dev/null \
+                    && echo "  ✅ $key" || echo "  ⚠️  $key"
+                done
+              exit 0
+              ;;
+
+            *)
+              echo "=== 模式 rollover：每个前缀只留最新一代 ==="
+
+              gh cache list -R "$GITHUB_REPOSITORY" --limit 200 \
+                --json id,key,createdAt > all.json
+
+              # 前缀 = key 去掉末尾 40 位提交号；每组只保留 createdAt 最新的那个，
+              # 其余全部删除。
+              # ⚠ jq 程序放在 scripts/cache-roll.jq：写在这个 run 块里做不了 ——
+              #   heredoc 的结束标记必须顶格，而 YAML 的 block scalar 要求
+              #   所有行都带缩进，两者直接冲突（解析直接报 could not find ':'）。
+              jq -r --argjson include_dl "$INCLUDE_DL" \
+                -f "$GITHUB_WORKSPACE/scripts/cache-roll.jq" all.json > del.tsv
+
+              if [ ! -s del.tsv ]; then
+                echo "没有需要清理的旧代"
+                exit 0
+              fi
+
+              echo "待删 $(wc -l < del.tsv) 个："
+              while IFS=$'\t' read -r id key; do
+                [ -n "${id:-}" ] || continue
+                if gh cache delete "$id" -R "$GITHUB_REPOSITORY" 2>/dev/null; then
+                  echo "  ✅ $key"; DELETED=$((DELETED+1))
+                else
+                  echo "  ⚠️  $key"; FAILED=$((FAILED+1))
+                fi
+              done < del.tsv
+              echo "删除 $DELETED 个，失败 $FAILED 个"
+              ;;
+          esac
+
+      - name: Show after
+        if: always()
+        run: |
+          echo "===== 清理后 ====="
+          gh cache list -R "$GITHUB_REPOSITORY" --limit 200 \
+            --json key,sizeInBytes,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[]
+                  | "\(.createdAt[0:16])  \(.sizeInBytes/1048576|floor)MB  \(.key)"'
+          {
+            echo "### 缓存清理（mode=$MODE）"
+            echo ""
+            echo '```'
+            gh cache list -R "$GITHUB_REPOSITORY" --limit 200 \
+              --json key,sizeInBytes,createdAt \
+              --jq 'sort_by(.createdAt) | reverse | .[]
+                    | "\(.createdAt[0:16])  \(.sizeInBytes/1048576|floor)MB  \(.key)"'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -135,10 +135,54 @@ Windows 打包 / 解压 / git checkout 链路上反复丢失（`luci-app-pon-sta
 - 只有 `scope=firmware` 且编译成功才发 Release；`toolchain-only` 不发。
 - 空固件目录会跳过，不会发空 Release。
 - `fail_on_unmatched_files: false`：机型产物后缀不同（`*.itb` / `*.ubi` / `*.bin` / `*.manifest` 等），缺哪种都不会让这一步失败。
-- 自动清理：每个机型的 Release 只保留最近 10 个（`delete_tag_pattern: ^<DEVICE_NAME>-`，不会误删 `toolchain-cache`）。
+- 自动清理：每个机型的 Release 只保留最近 10 个（`delete_tag_pattern: ^<DEVICE_NAME>-`）。
 - 关掉 Release 只留 Artifact：把 `upload_release` 选 `false`，或把 env 里 `UPLOAD_RELEASE` 默认值改成 `'false'`。
 
 > 首次运行建议先 `scope=toolchain-only`（不产固件、不发 Release）把工具链缓存建起来，再跑 `firmware`。
+> 现在缓存是滚动式的，**第一次 `firmware` 跑完也会自动存下工具链**，所以这一步只是给怕 6 小时超时的人用的。
+
+## 构建缓存（移植自 VIKINGYFY/OpenWRT-CI）
+
+一份缓存 = 三个目录，由 `actions/cache` 直接存取（不打 tar、不走 Release）：
+
+```
+/workdir/openwrt/staging_dir/host*     host 工具 + hostpkg（go / python 在这）
+/workdir/openwrt/staging_dir/tool*     交叉编译器 toolchain-<board>_<subtarget>
+/workdir/openwrt/.ccache               编译对象缓存（USE_CCACHE=true 时才有内容）
+```
+
+| | key |
+|---|---|
+| 写入用 | `ponwrt-<源站>-<分支>-<SoC>-<上游提交号>` |
+| 恢复用 | `ponwrt-<源站>-<分支>-<SoC>-` **（前缀回退）** |
+
+**为什么这样就不会「永远 miss」**：前缀只由源站 / 分支 / SoC 决定，配置、机型、
+diy 脚本都不进 key。上游一提交就换一代，恢复时靠 `restore-keys` 回退到该前缀下
+最近的一代 —— 于是「命中」不再取决于两个地方算的指纹能不能对上。
+
+之前那套 `compile -> md5 指纹 -> 精确匹配 + Release 兜底` 已整体删除，原因是它
+只要指纹里有一项两端算得不一致（或者上游改了一行 `tools/` 的 Makefile），就退化成
+每次全量重编 1~1.5 小时，而且没有任何自愈路径。
+
+恢复之后脚本会做三件事（`scripts/pwrt-cache.sh prepare`），缺一件就等于白命中：
+
+1. `touch` 所有**非 target** 的 stamp —— tar/zip 还原的是旧 mtime，源码树是刚 clone 的
+2. 写 `tmp/.build` —— 标记「构建环境已初始化」，否则 make 重走 prereq 阶段
+3. 目录本身也 touch —— 避免「目录比内容旧」
+
+配套的四个工作流：
+
+| 工作流 | 作用 |
+|---|---|
+| `build-ponwrt.yml` | 恢复 → 编译 → **成功后存新一代** → `cache-rollover` job 删掉同前缀的旧代 |
+| `warm-cache.yml` | 每周一预热/保活；key 口径与主流程同源（都调 `scripts/pwrt-cache.sh`） |
+| `cache-keepalive.yml` | 每 3 天真实恢复一次，避开 7 天未访问回收 |
+| `cache-clean.yml` | 手动/定时清理：`rollover` 只留最新一代（默认，不动 dl），`all` 全删 |
+
+`ignore_cache=true` 会跳过恢复强制重编（仍会存新一代）。
+
+> 迁移提示：旧的 `toolchain-cache` / `staging-cache` 两个 Release 已经不再被任何流程使用，
+> 可以在 Releases 页面手动删掉（`Remove old releases` 只按机型名匹配，不会碰它们）。
 
 ## 支持的机型
 
@@ -147,7 +191,7 @@ Windows 打包 / 解压 / git checkout 链路上反复丢失（`luci-app-pon-sta
 | AN7581 | `fiberhome_hg5382a` `fiberhome_hg5585f-ct` `fiberhome_hg5585f-cu` `gemtek_xg2010g` `nokia_xg-040g-md-ubi` `nokia_xg-040g-tf-ubi` `unionman_ung00a` `znxt_zn504xg-d` `znxt_zn515xg-d` |
 | AN7583 | `nokia_xg-040g-mf` `nokia_xg-040g-mf-ubi` |
 
-机型名写错会在 `Generate toolchain cache key` 步骤直接报 `::error::` 并退出，不会静默地全机型编译。
+机型名写错会在 `Validate configuration` 步骤直接报 `::error::` 并退出，不会静默地全机型编译。
 
 ## NPU 固件
 
