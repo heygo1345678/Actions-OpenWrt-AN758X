@@ -453,12 +453,11 @@ jobs:
         #   设了 continue-on-error 之后，Setup 步骤会看到空的 APP_TOKEN
         #   并自动回退到 PAT，构建不至于卡死在编译前。
         continue-on-error: true
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@v1
         with:
           # v1 用 app-id（App 的「App ID」）；升到 v3 要改名为 client-id 并且
           # 填的是「Client ID」，两者不是同一个值，别直接换版本号了事。
           app-id: ${{ secrets.PRIVATE_SOURCE_APP_ID }}
-          client-id: ${{ secrets.PRIVATE_SOURCE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PRIVATE_SOURCE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
@@ -711,6 +710,38 @@ jobs:
       #     【唯一一次 defconfig】后续步骤不再调用，避免 .config 被重新展开、
       #     机型配置里显式写死的选择被静默剔除
       # =========================================================
+      # =========================================================
+      # ★ 用 runner 预装工具替代从源码编译（OpenWRT-CI 核心思路）
+      #
+      #   Go external bootstrap   省 40~70 分钟
+      #   Rust prebuilt           省 30~60 分钟
+      #   BPF host LLVM / Python PGO 关闭
+      #
+      #   ⚠ 必须在 make defconfig 之前：脚本写进 .config 的配置项
+      #     要由 defconfig 展开确认。
+      #
+      #   全部软失败 —— ponwrt 不支持时只 warning，退回源码编译，
+      #   绝不让构建死在这里。
+      # =========================================================
+      - name: Prepare host toolchain (Go / BPF / Python)
+        continue-on-error: true
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          S="$GITHUB_WORKSPACE/scripts/prepare-build-host.sh"
+          [ -f "$S" ] || { echo "::warning::缺 $S，跳过 host 加速"; exit 0; }
+          dos2unix "$S" 2>/dev/null || true
+          bash "$S" "$BUILD_ROOT/openwrt"
+
+      - name: Prepare Rust toolchain (prebuilt)
+        continue-on-error: true
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          S="$GITHUB_WORKSPACE/scripts/prepare-rust.sh"
+          [ -f "$S" ] || { echo "::warning::缺 $S，跳过 rust 预编译"; exit 0; }
+          dos2unix "$S" 2>/dev/null || true
+          bash "$S" "$BUILD_ROOT/openwrt"
+
+
       - name: Generate toolchain cache key
         id: cache-key
         run: |

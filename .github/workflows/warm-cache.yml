@@ -154,6 +154,30 @@ jobs:
             xz-utils tar unzip zip zstd dos2unix gettext \
             rsync file wget curl git subversion 2>/dev/null || true
 
+          # =========================================================
+          # ★ 参照 OpenWRT-CI：装 runner 侧的工具链
+          #
+          #   这一小步是整套加速的前提 —— 后面的
+          #   prepare-build-host.sh / prepare-rust.sh 要用它们
+          #   直接替代从源码编译：
+          #     golang      → Go external bootstrap  省 40~70 分钟
+          #     rustup      → Rust prebuilt          省 30~60 分钟
+          #     clang/llvm  → BPF host toolchain
+          #     ccache      → 跨构建复用编译结果
+          #
+          #   装不上不影响构建（脚本会检测并退回源码编译），
+          #   所以整体 continue-on-error 风格，不阻断。
+          # =========================================================
+          sudo -E apt-get -yqq install golang-go rustup ccache \
+            libclang-dev libbpf-dev lld 2>/dev/null || \
+            echo "::warning::runner 工具链未装全，host 加速会部分失效（退回源码编译）"
+
+          # rustup 装完只是 wrapper，真正工具链要显式装 stable
+          which rustup >/dev/null 2>&1 && {
+            rustup toolchain install stable --profile minimal 2>/dev/null || true
+            rustup default stable 2>/dev/null || true
+          }
+
           if [ -x "$GITHUB_WORKSPACE/scripts/init_build_environment.sh" ]; then
             bash "$GITHUB_WORKSPACE/scripts/init_build_environment.sh" || true
           else
@@ -243,6 +267,33 @@ jobs:
             exit 1
           fi
           sed -i '/CONFIG_TARGET_DEVICE_/d; /^CONFIG_TARGET_MULTI_PROFILE=/d' .config
+
+      # =========================================================
+      # ★ 用 runner 预装工具替代从源码编译（OpenWRT-CI 的核心思路）
+      #
+      #   必须在 make defconfig 【之前】改 .config，
+      #   因为这两个脚本会往 .config 里写配置项。
+      #
+      #   全部软失败：ponwrt 不支持时只 warning，退回源码编译。
+      # =========================================================
+      - name: Prepare host toolchain (Go / BPF / Python)
+        continue-on-error: true
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          S="$GITHUB_WORKSPACE/scripts/prepare-build-host.sh"
+          [ -f "$S" ] || { echo "::warning::缺 $S，跳过 host 加速"; exit 0; }
+          dos2unix "$S" 2>/dev/null || true
+          bash "$S" "$BUILD_ROOT/openwrt"
+
+      - name: Prepare Rust toolchain (prebuilt)
+        continue-on-error: true
+        run: |
+          cd "$BUILD_ROOT/openwrt"
+          S="$GITHUB_WORKSPACE/scripts/prepare-rust.sh"
+          [ -f "$S" ] || { echo "::warning::缺 $S，跳过 rust 预编译"; exit 0; }
+          dos2unix "$S" 2>/dev/null || true
+          bash "$S" "$BUILD_ROOT/openwrt"
+
           make defconfig 2>&1 | tail -5
 
       # =========================================================
@@ -567,6 +618,41 @@ jobs:
           path: ${{ github.workspace }}/build-reports/
           retention-days: 7
 
+      # =========================================================
+      # 缓存轮换（参照 OpenWRT-CI 的 cache-rollover）
+      #
+      #   指纹一变 key 就变，旧条目再也没人用，却一直占着
+      #   actions/cache 的 10GB 配额。这里把同前缀的旧条目删掉，
+      #   保证每个 subtarget 只留一份。
+      #
+      #   ⚠ 要等当前 key 真的可用了再删，否则把唯一的缓存删光。
+      # =========================================================
+      - name: Roll cache generations
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          KEY="${{ steps.fp.outputs.STAGING_KEY }}"
+          PREFIX="${{ steps.fp.outputs.STAGING_PREFIX }}"
+          [ -n "$KEY" ] || { echo "无 key，跳过轮换"; exit 0; }
+
+          if ! gh cache list -R "$GITHUB_REPOSITORY" --key "$KEY" \
+               --json key --jq '.[].key' 2>/dev/null | grep -qx "$KEY"; then
+            echo "当前 key 尚不可用，跳过轮换"
+            exit 0
+          fi
+
+          gh cache list -R "$GITHUB_REPOSITORY" --key "$PREFIX" \
+            --limit 100 --json id,key --jq '.[] | [.id, .key] | @tsv' 2>/dev/null |
+            while IFS=$'\t' read -r id k; do
+              [ -n "$id" ] || continue
+              [ "$k" = "$KEY" ] && continue
+              echo "删除旧缓存: $k"
+              gh cache delete "$id" -R "$GITHUB_REPOSITORY" || \
+                echo "::warning::删除失败 $k"
+            done
+
       - name: Summary
         if: always()
         run: |
@@ -578,4 +664,16 @@ jobs:
             echo "- 命中: actions/cache=${{ steps.staging-restore.outputs.cache-hit || 'false' }} Release=${{ steps.staging-release-restore.outputs.restored || 'false' }}"
             echo "- 本次编译: ${{ steps.staging-unpack.outputs.unpacked != 'true' && '是' || '否（已命中）' }}"
             echo "- 打包: ${{ steps.pack.outputs.packed || 'n/a' }}"
+            echo ""
+            echo "#### host 工具链加速"
+            if [ -f "$GITHUB_WORKSPACE/build-reports/host-toolchains.txt" ]; then
+              echo '```'
+              cat "$GITHUB_WORKSPACE/build-reports/host-toolchains.txt"
+              echo '```'
+            fi
+            if [ -f "$GITHUB_WORKSPACE/build-reports/rust-toolchain.txt" ]; then
+              echo '```'
+              cat "$GITHUB_WORKSPACE/build-reports/rust-toolchain.txt"
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
