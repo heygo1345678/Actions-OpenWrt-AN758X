@@ -310,6 +310,24 @@ unpack)
   # 目录本身也 touch，避免「目录比内容旧」触发不必要的重建
   find staging_dir -maxdepth 1 -type d -exec touch {} + 2>/dev/null || true
 
+  # -------------------------------------------------------------
+  # ★ tmp/.build —— 参照 VIKINGYFY/OpenWRT-CI，这是他们恢复缓存后
+  #   必做的一步，我此前完全漏了。
+  #
+  #   OpenWrt 靠 tmp/.build 判断「构建环境是否已初始化」。
+  #   没有它，make 会重新走一遍 prereq / prepare 阶段 ——
+  #   表现为 tools/ 与 toolchain/ 明明已在 staging_dir 里，
+  #   却仍然被重新编译一遍。
+  #
+  #   与 .built stamp 是两回事：
+  #     .built     —— 单个包「已编译」
+  #     tmp/.build —— 整个构建环境「已初始化」
+  #   两者都要有。
+  # -------------------------------------------------------------
+  mkdir -p tmp
+  echo "1" > tmp/.build
+  echo "tmp/.build 已写入（标记构建环境已初始化）"
+
   echo "unpacked=true" >> "${GITHUB_OUTPUT:-/dev/null}"
   echo "✅ staging_dir 已从缓存恢复（stamp 已刷新）"
 
