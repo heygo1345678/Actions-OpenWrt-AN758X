@@ -453,11 +453,12 @@ jobs:
         #   设了 continue-on-error 之后，Setup 步骤会看到空的 APP_TOKEN
         #   并自动回退到 PAT，构建不至于卡死在编译前。
         continue-on-error: true
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           # v1 用 app-id（App 的「App ID」）；升到 v3 要改名为 client-id 并且
           # 填的是「Client ID」，两者不是同一个值，别直接换版本号了事。
           app-id: ${{ secrets.PRIVATE_SOURCE_APP_ID }}
+          client-id: ${{ secrets.PRIVATE_SOURCE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PRIVATE_SOURCE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
