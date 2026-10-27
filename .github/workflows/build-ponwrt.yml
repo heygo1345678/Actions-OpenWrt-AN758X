@@ -30,10 +30,18 @@ env:
   #   ★ 关键在于 key 里【只有】提交号会变，前缀永远稳定：
   #     上游一提交就换一代，恢复时靠前缀回退总能拿到最近一代，
   #     所以「有没有命中」不再取决于我们自己算的指纹能不能对上。
-  #     以前那套 md5 指纹 + 精确匹配 + Release 兜底已经整个拿掉了。
+  #     以前那套 md5 指纹 + 精确匹配已经拿掉了。
+  #
+  #   两条通道，同一份内容、同一套 key：
+  #     ① actions/cache  —— 快（GitHub 内网），但 7 天无访问会被回收
+  #     ② Release 备份   —— 慢（走 gh 下载 ~1GB），但永不过期
+  #   恢复顺序 ① → ②：① 没命中才去 ② 取；两条都没取到才真编译。
+  #   保存时两条都写（② 失败只 warning，不影响构建结论）。
   # =========================================================
   # actions/cache 的 with.path 不接受 GITHUB_ENV 动态值，必须 workflow 级静态
   CACHE_ROOT: /workdir/openwrt
+  CACHE_RELEASE: cache-backup
+  RELEASE_BACKUP: ${{ github.event.inputs.release_backup == 'false' && 'false' || 'true' }}
   TZ: Asia/Shanghai
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   REPO_BRANCH: ${{ github.event.inputs.branch || 'master' }}
@@ -164,6 +172,14 @@ on:
         options:
           - 'false'
           - 'true'
+      release_backup:
+        description: 'Release 备份通道（actions/cache 7 天无访问会回收，Release 不会）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
       # 覆盖口：不填即为 env.FW_AUTHOR 的 "qwe"。保留输入项仅为临时指定其他作者。
       fw_author:
         description: '覆盖固件版本后缀的作者名（LuCI 概览页「固件版本」）。留空 = qwe'
@@ -393,20 +409,87 @@ jobs:
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
       # =========================================================
-      # 2.3 恢复之后：让 make 认账
+      # 2.3 构建缓存：Release 备份通道（① 没命中才走）
+      #
+      #   为什么还要这条：actions/cache 的条目 7 天没人访问就被回收，
+      #   7 天规则卡的是「最后访问时间」而不是「创建时间」。仓库不是
+      #   每天编译，赶上停摆一周，快通道就空了 —— 那时从 Release 取，
+      #   仍然不用冷编译。
+      #
+      #   ★ 取「该前缀下创建时间最新」的那一份，而不是精确 key：
+      #     与 actions/cache 的前缀回退同义，提交号变了也照样能用。
+      #   ★ 先上传新的再删旧的（见 Save 步骤），任何时刻都至少有一份在。
+      # =========================================================
+      - name: Restore cache from Release backup
+        id: release-restore
+        if: >-
+          env.IGNORE_CACHE != 'true'
+          && env.RELEASE_BACKUP == 'true'
+          && steps.cache-restore.outputs.cache-matched-key == ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$CACHE_ROOT"
+          PREFIX="${{ steps.cache-key.outputs.prefix }}"
+
+          if ! gh release view "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "Release $CACHE_RELEASE 还不存在（首次运行），走真编译"
+            exit 0
+          fi
+
+          # 该前缀下最新的一份；没有就认命
+          ASSET=$(gh release view "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" \
+                    --json assets -q '.assets[] | "\(.createdAt) \(.name)"' 2>/dev/null \
+                  | grep " ${PREFIX}-" | sort -r | head -1 | awk '{print $2}')
+
+          if [ -z "$ASSET" ]; then
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "Release 里没有 ${PREFIX}-* 的备份"
+            exit 0
+          fi
+
+          echo "从 Release 取备份: $ASSET"
+          which unzstd >/dev/null 2>&1 || sudo -E apt-get -yqq install zstd >/dev/null 2>&1 || true
+
+          if ! gh release download "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" -p "$ASSET" -D .; then
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::下载 $ASSET 失败"
+            exit 0
+          fi
+
+          if bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" unpack "$CACHE_ROOT" "./$ASSET"; then
+            rm -f "./$ASSET"
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 已从 Release 备份恢复: $ASSET"
+          else
+            rm -f "./$ASSET"
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::解压 $ASSET 失败，走真编译"
+          fi
+
+      # =========================================================
+      # 2.4 恢复之后：让 make 认账
       #
       #   刷新非 target 的 stamp + 写 tmp/.build。
       #   漏了这一步，make 会因为「源码树比产物新」把工具链重编一遍，
       #   日志却显示 Cache restored successfully —— 白命中。
+      #
+      #   两条通道谁命中都要走这一步，所以条件是二者的或。
       # =========================================================
       - name: Prepare restored build cache
-        if: env.IGNORE_CACHE != 'true' && steps.cache-restore.outputs.cache-matched-key != ''
+        if: >-
+          env.IGNORE_CACHE != 'true'
+          && (steps.cache-restore.outputs.cache-matched-key != ''
+              || steps.release-restore.outputs.restored == 'true')
         env:
-          RESTORED_FROM: ${{ steps.cache-restore.outputs.cache-matched-key }}
+          RESTORED_FROM: ${{ steps.cache-restore.outputs.cache-matched-key || format('Release:{0}', steps.release-restore.outputs.restored) }}
         run: |
           cd "$CACHE_ROOT"
-          echo "恢复自: $RESTORED_FROM"
-          echo "精确命中: ${{ steps.cache-restore.outputs.cache-hit }}"
+          echo "来源: $RESTORED_FROM"
+          echo "actions/cache 精确命中: ${{ steps.cache-restore.outputs.cache-hit }}"
+          echo "Release 备份恢复: ${{ steps.release-restore.outputs.restored }}"
           bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" prepare "$CACHE_ROOT"
 
       # =========================================================
@@ -910,7 +993,8 @@ jobs:
       - name: Download toolchain sources
         if: >-
           env.IGNORE_CACHE == 'true'
-          || steps.cache-restore.outputs.cache-matched-key == ''
+          || (steps.cache-restore.outputs.cache-matched-key == ''
+              && steps.release-restore.outputs.restored != 'true')
         run: |
           cd "$BUILD_ROOT/openwrt"
 
@@ -960,7 +1044,8 @@ jobs:
         id: toolchain
         if: >-
           env.IGNORE_CACHE == 'true'
-          || steps.cache-restore.outputs.cache-matched-key == ''
+          || (steps.cache-restore.outputs.cache-matched-key == ''
+              && steps.release-restore.outputs.restored != 'true')
         run: |
           cd "$BUILD_ROOT/openwrt"
 
@@ -981,14 +1066,17 @@ jobs:
         run: |
           HIT='${{ steps.cache-restore.outputs.cache-hit }}'
           MATCHED='${{ steps.cache-restore.outputs.cache-matched-key }}'
+          REL='${{ steps.release-restore.outputs.restored }}'
           if [ "${IGNORE_CACHE}" = "true" ]; then
             DECISION="ignore_cache=true，按要求跳过恢复、强制重编"
-          elif [ -z "$MATCHED" ]; then
-            DECISION="无可用缓存，冷编译（本次会存第一代）"
-          elif [ "$HIT" = "true" ]; then
-            DECISION="精确命中，工具链一步没编"
+          elif [ -n "$MATCHED" ] && [ "$HIT" = "true" ]; then
+            DECISION="actions/cache 精确命中，工具链一步没编"
+          elif [ -n "$MATCHED" ]; then
+            DECISION="actions/cache 前缀回退命中上一代，工具链没编；本次存新一代"
+          elif [ "$REL" = "true" ]; then
+            DECISION="actions/cache 空空，已从 Release 备份恢复；本次回填快通道"
           else
-            DECISION="前缀回退命中上一代，工具链没编；本次存新一代"
+            DECISION="两条通道都没有，冷编译（本次会同时存两处）"
           fi
 
           {
@@ -996,12 +1084,13 @@ jobs:
             echo ""
             echo "- 决定：${DECISION}"
             echo "- key：\`${{ steps.cache-key.outputs.key }}\`"
-            if [ -n "$MATCHED" ]; then echo "- 实际恢复自：\`${MATCHED}\`"; fi
-            echo "- 恢复出工具链：$([ "${{ steps.toolchain.outcome }}" = "skipped" ] && echo '是' || echo '否')"
+            if [ -n "$MATCHED" ]; then echo "- actions/cache 恢复自：\`${MATCHED}\`"; fi
+            if [ "$REL" = "true" ]; then echo "- Release 备份：已恢复"; fi
+            echo "- 编译工具链：$([ "${{ steps.toolchain.outcome }}" = "skipped" ] && echo '否（缓存已给出）' || echo '是')"
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "key      : ${{ steps.cache-key.outputs.key }}"
-          echo "命中     : ${HIT:-false} / matched=${MATCHED:-none}"
+          echo "命中     : ${HIT:-false} / matched=${MATCHED:-none} / release=${REL:-false}"
           echo "编译工具链: ${{ steps.toolchain.outcome }}"
 
       # =========================================================
@@ -1138,6 +1227,68 @@ jobs:
             ${{ env.CACHE_ROOT }}/.ccache
             ${{ env.CACHE_ROOT }}/staging_dir/host*
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
+
+      # =========================================================
+      # 18.6 存一份到 Release 备份（长期，不受 7 天回收影响）
+      #
+      #   与上一步同一份内容、同一个 key，只是换了存放介质：
+      #     actions/cache  快，但 7 天无访问就没了
+      #     Release 资产    慢（~1GB 走 gh 下载），但一直在
+      #
+      #   ★ 顺序：先上传新的，再删同前缀的旧代。
+      #     反过来的话，上传失败就变成「旧的删了、新的没上去」——
+      #     备份通道就此归零。
+      #   ★ 单文件超过 2 GiB 会被 GitHub 拒，先量体积再决定要不要传。
+      # =========================================================
+      - name: Save cache to Release backup
+        if: >-
+          env.RELEASE_BACKUP == 'true'
+          && success()
+          && steps.cache-restore.outputs.cache-hit != 'true'
+          && (steps.compile.outcome == 'success' || steps.toolchain.outcome == 'success')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$CACHE_ROOT"
+          KEY="${{ steps.cache-key.outputs.key }}"
+          PREFIX="${{ steps.cache-key.outputs.prefix }}"
+          TARBALL="${KEY}.tzst"
+
+          # .ccache 没启用时会是空目录，tar 里只有 staging_dir 两个大件
+          which zstd >/dev/null 2>&1 || sudo -E apt-get -yqq install zstd >/dev/null 2>&1 || true
+
+          if ! bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" pack "$CACHE_ROOT" "$CACHE_ROOT/$TARBALL"; then
+            echo "::warning::打包失败，跳过 Release 备份"
+            exit 0
+          fi
+
+          SZ=$(stat -c%s "$TARBALL")
+          if [ "$SZ" -gt 2000000000 ]; then
+            echo "::warning::${SZ} 字节超过 Release 单文件 2 GiB 上限，跳过备份；actions/cache 那条通道仍然有效"
+            rm -f "$TARBALL"; exit 0
+          fi
+
+          if ! gh release view "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" \
+              --title "Build Cache Backup" \
+              --notes "整体构建缓存（staging_dir/host* + tool* + .ccache）的长期备份，由 build-ponwrt / warm-cache 自动维护，请勿手动删除。" \
+              --latest=false || true
+          fi
+
+          echo "上传 $TARBALL ($(( SZ / 1048576 )) MB)"
+          gh release upload "$CACHE_RELEASE" "$TARBALL" --repo "$GITHUB_REPOSITORY" --clobber
+
+          # 同前缀的其它代已经没有用了（前缀回退只会取最新那份）
+          gh release view "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[] | "\(.createdAt) \(.name)"' 2>/dev/null \
+            | grep " ${PREFIX}-" | awk '{print $2}' | grep -vx "$TARBALL" \
+            | while read -r old; do
+                echo "删除旧备份: $old"
+                gh release delete-asset "$CACHE_RELEASE" "$old" --repo "$GITHUB_REPOSITORY" -y 2>/dev/null || true
+              done
+
+          rm -f "$TARBALL"
 
       # =========================================================
       # 19. 空间检查

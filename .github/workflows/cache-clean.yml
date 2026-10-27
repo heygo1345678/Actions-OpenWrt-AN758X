@@ -10,8 +10,9 @@ name: Cache Clean
 #   所以这里把「删什么」做成显式选项，默认只做轮换：
 #
 #     rollover  每个前缀只留创建时间最新的一代（默认，可定时跑）
-#     all       全删（等价上游的 gh cache delete --all，慎用）
+#     backup    只清 Release 备份（cache-backup）里的旧代
 #     prefix    只删指定前缀下的全部条目
+#     all       全删，连 Release 备份一起删（等价上游的 gh cache delete --all，慎用）
 #
 #   ⚠ 无论哪种模式，dl 缓存（ponwrt-dl-*）都不在默认清理范围：
 #     它是纯增量下载缓存，越老越有用，删了等于白白重下几个 G。
@@ -28,6 +29,7 @@ on:
         type: choice
         options:
           - rollover
+          - backup
           - prefix
           - all
       prefix:
@@ -55,6 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CACHE_RELEASE: cache-backup
       MODE: ${{ github.event.inputs.mode || 'rollover' }}
       PREFIX: ${{ github.event.inputs.prefix || '' }}
       INCLUDE_DL: ${{ github.event.inputs.include_dl || 'false' }}
@@ -100,9 +103,46 @@ jobs:
                   gh cache delete "$id" -R "$GITHUB_REPOSITORY" 2>/dev/null \
                     && echo "  ✅ $key" || echo "  ⚠️  $key"
                 done
+
+              # 「全删」也必须把 Release 备份清掉，否则下次构建会从备份
+              # 原样恢复回来 —— 用户以为清了，其实没清。
+              echo "=== 模式 all：同时删除 Release 备份 $CACHE_RELEASE ==="
+              if gh release view "$CACHE_RELEASE" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                gh release delete "$CACHE_RELEASE" -R "$GITHUB_REPOSITORY" -y --cleanup-tag \
+                  && echo "  ✅ 已删除 release $CACHE_RELEASE" \
+                  || echo "  ⚠️  删除 release 失败"
+              else
+                echo "  （release $CACHE_RELEASE 不存在，跳过）"
+              fi
               exit 0
               ;;
 
+            backup)
+              echo "=== 模式 backup：只清 Release 备份，每前缀留最新一代 ==="
+              if ! gh release view "$CACHE_RELEASE" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                echo "（release $CACHE_RELEASE 不存在）"; exit 0
+              fi
+
+              # 资产名形如 ponwrt-<源>-<分支>-<soc>-<sha40>.tzst，
+              # 去掉末尾提交号即为「前缀」，同前缀只留 createdAt 最新那个
+              LAST=""
+              gh release view "$CACHE_RELEASE" -R "$GITHUB_REPOSITORY" \
+                --json assets -q '.assets[] | "\(.createdAt) \(.name)"' |
+                sort -r | awk '{print $2}' |
+                while IFS= read -r name; do
+                  [ -n "$name" ] || continue
+                  p=$(printf '%s' "$name" | sed -E 's/-[0-9a-f]{40}\.tzst$//')
+                  if [ "$p" = "$LAST" ]; then
+                    echo "  🗑  $name"
+                    gh release delete-asset "$CACHE_RELEASE" "$name" \
+                      -R "$GITHUB_REPOSITORY" -y 2>/dev/null || echo "  ⚠️  删除失败 $name"
+                  else
+                    LAST="$p"
+                    echo "  ✅ 保留 $name"
+                  fi
+                done
+              exit 0
+              ;;
             prefix)
               [ -n "$PREFIX" ] || { echo "::error::mode=prefix 必须填 prefix"; exit 1; }
               echo "=== 模式 prefix：删除 ${PREFIX}* ==="

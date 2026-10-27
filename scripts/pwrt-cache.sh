@@ -30,8 +30,11 @@
 #
 #   子命令：
 #     key       <openwrt_dir>   算 PREFIX / KEY（写 GITHUB_OUTPUT / GITHUB_ENV）
+#     prefix                    只算前缀（不需要 git 仓库）
 #     prepare   <openwrt_dir>   恢复后刷新 stamp、写 tmp/.build
 #     rollover                  删掉同前缀的旧代（读环境里的 PREFIX / KEY）
+#     pack      <ow> <outfile>  打包三个缓存目录（Release 备份通道）
+#     unpack    <ow> <infile>   解开 Release 备份
 #     status    <openwrt_dir>   打印体积与版本，写 $REPORT_DIR/pwrt-cache.txt
 #
 #   环境变量（由 workflow 提供）：
@@ -222,6 +225,71 @@ cmd_rollover() {
 }
 
 # ---------------------------------------------------------------
+# pack / unpack —— Release 备份通道用
+#
+#   actions/cache 的条目 7 天没人访问就回收，Release 资产不会 ——
+#   所以除了快通道，还往 Release 存一份同样的内容当长期兜底。
+#
+#   ★ 刻意只打「缓存路径那三个目录」，与 actions/cache 的 path 逐字一致：
+#     两边内容一致，才能「哪边先命中都算数」。
+#   ★ 用相对路径打包（cwd = openwrt 目录），解包时 -C 回同一目录即可，
+#     不会把 /workdir 这种机器相关前缀腌进 tar 里。
+# ---------------------------------------------------------------
+cache_paths() {   # 打印要打包的顶层条目（不存在的跳过）
+  [ -e .ccache ] && echo ".ccache"
+  ls -d staging_dir/host staging_dir/hostpkg staging_dir/toolchain* 2>/dev/null
+  return 0
+}
+
+cmd_pack() {
+  # ⚠ 参数必须显式传进来：函数默认拿不到脚本自己的 $3（set -u 下会直接 unbound）
+  local out="${1:-}"
+  cd "$OW" || { echo "::error::无法进入 $OW"; exit 1; }
+  [ -n "$out" ] || { echo "::error::用法: $0 pack <openwrt_dir> <outfile>"; exit 1; }
+
+  local list; list=$(mktemp)
+  cache_paths > "$list"
+
+  if [ ! -s "$list" ]; then
+    echo "::warning::没有可打包的目录（staging_dir 还是空的？）"
+    rm -f "$list"; exit 1
+  fi
+
+  echo "打包清单："
+  sed 's/^/  /' "$list"
+
+  mkdir -p "$(dirname "$out")"
+  rm -f "$out"
+  # zstdmt 多线程更快；没有 zstd 就退回普通 gzip-free tar
+  if tar -I zstdmt -cf "$out" -T "$list" 2>/dev/null \
+     || tar -I zstd -cf "$out" -T "$list" 2>/dev/null \
+     || tar -cf "$out" -T "$list"; then
+    ls -lh "$out"
+    echo "packed=true"
+  else
+    echo "::warning::打包失败"
+    rm -f "$out"; exit 1
+  fi
+  rm -f "$list"
+}
+
+cmd_unpack() {
+  local in="${1:-}"
+  cd "$OW" || { echo "::error::无法进入 $OW"; exit 1; }
+  [ -n "$in" ] || { echo "::error::用法: $0 unpack <openwrt_dir> <infile>"; exit 1; }
+  [ -f "$in" ] || { echo "::warning::$in 不存在"; exit 1; }
+
+  if tar -I unzstd -xf "$in" 2>/dev/null \
+     || tar -I zstd -xf "$in" 2>/dev/null \
+     || tar -xf "$in"; then
+    echo "unpacked=true"
+  else
+    echo "::warning::解压失败"
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------
 # status —— 体积与版本，落一份报告给 artifact
 # ---------------------------------------------------------------
 cmd_status() {
@@ -268,9 +336,11 @@ case "$CMD" in
   prefix)   cmd_prefix ;;
   prepare)  cmd_prepare ;;
   rollover) cmd_rollover ;;
+  pack)     cmd_pack   "${3:-}" ;;
+  unpack)   cmd_unpack "${3:-}" ;;
   status)   cmd_status ;;
   *)
-    echo "用法: $0 {key|prefix|prepare|rollover|status} <openwrt_dir>" >&2
+    echo "用法: $0 {key|prefix|prepare|rollover|pack|unpack|status} <openwrt_dir> [file]" >&2
     exit 1
     ;;
 esac

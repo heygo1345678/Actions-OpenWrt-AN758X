@@ -143,13 +143,21 @@ Windows 打包 / 解压 / git checkout 链路上反复丢失（`luci-app-pon-sta
 
 ## 构建缓存（移植自 VIKINGYFY/OpenWRT-CI）
 
-一份缓存 = 三个目录，由 `actions/cache` 直接存取（不打 tar、不走 Release）：
+一份缓存 = 三个目录，同一份内容存**两个地方**：
 
 ```
 /workdir/openwrt/staging_dir/host*     host 工具 + hostpkg（go / python 在这）
 /workdir/openwrt/staging_dir/tool*     交叉编译器 toolchain-<board>_<subtarget>
 /workdir/openwrt/.ccache               编译对象缓存（USE_CCACHE=true 时才有内容）
 ```
+
+| 通道 | 介质 | 特点 |
+|---|---|---|
+| ① 快通道 | `actions/cache` | GitHub 内网，秒级；但 **7 天无访问即回收** |
+| ② 备份通道 | Release `cache-backup` 资产 | 走 `gh` 下载 ~1 GB，慢；**永不过期** |
+
+恢复顺序 ① → ②：① 没命中才去 ② 取，两条都没取到才真编译。保存时两条都写
+（② 失败只 `::warning::`，不影响构建结论）。
 
 | | key |
 |---|---|
@@ -160,9 +168,14 @@ Windows 打包 / 解压 / git checkout 链路上反复丢失（`luci-app-pon-sta
 diy 脚本都不进 key。上游一提交就换一代，恢复时靠 `restore-keys` 回退到该前缀下
 最近的一代 —— 于是「命中」不再取决于两个地方算的指纹能不能对上。
 
-之前那套 `compile -> md5 指纹 -> 精确匹配 + Release 兜底` 已整体删除，原因是它
-只要指纹里有一项两端算得不一致（或者上游改了一行 `tools/` 的 Makefile），就退化成
-每次全量重编 1~1.5 小时，而且没有任何自愈路径。
+之前那套 `compile -> md5 指纹 -> 精确匹配` 已整体删除，原因是它只要指纹里有一项
+两端算得不一致（或者上游改了一行 `tools/` 的 Makefile），就退化成每次全量重编
+1~1.5 小时，而且没有任何自愈路径。
+
+**Release 备份怎么维护**：每次保存时先把新资产传上去，再删同前缀的旧代 ——
+顺序反过来的话，一旦上传失败就变成「旧的删了、新的没上去」，备份通道直接归零。
+单文件超过 2 GiB 会被 GitHub 拒，超限时只跳过备份、快通道照常。两条通道都不要时
+（比如想彻底重置）把 `release_backup` 选 `false`，并清空 Actions → Caches。
 
 恢复之后脚本会做三件事（`scripts/pwrt-cache.sh prepare`），缺一件就等于白命中：
 
@@ -174,15 +187,15 @@ diy 脚本都不进 key。上游一提交就换一代，恢复时靠 `restore-ke
 
 | 工作流 | 作用 |
 |---|---|
-| `build-ponwrt.yml` | 恢复 → 编译 → **成功后存新一代** → `cache-rollover` job 删掉同前缀的旧代 |
+| `build-ponwrt.yml` | ①→② 恢复 → 编译 → **成功后两处都存** → `cache-rollover` job 删掉同前缀的旧代 |
 | `warm-cache.yml` | 每周一预热/保活；key 口径与主流程同源（都调 `scripts/pwrt-cache.sh`） |
 | `cache-keepalive.yml` | 每 3 天真实恢复一次，避开 7 天未访问回收 |
 | `cache-clean.yml` | 手动/定时清理：`rollover` 只留最新一代（默认，不动 dl），`all` 全删 |
 
 `ignore_cache=true` 会跳过恢复强制重编（仍会存新一代）。
 
-> 迁移提示：旧的 `toolchain-cache` / `staging-cache` 两个 Release 已经不再被任何流程使用，
-> 可以在 Releases 页面手动删掉（`Remove old releases` 只按机型名匹配，不会碰它们）。
+> 迁移提示：更早那版的 `toolchain-cache` / `staging-cache` 两个 Release 已经不再被任何流程使用，
+> 可以在 Releases 页面手动删掉；现在统一用 `cache-backup`（`Remove old releases` 按机型名匹配，不会碰它）。
 
 ## 支持的机型
 

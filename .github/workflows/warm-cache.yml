@@ -13,6 +13,10 @@ name: Warm Build Cache
 #     主流程靠 restore-keys 前缀回退必定能取到。
 #     以前那种「指纹两端各算一遍，算不齐就永不命中」的坑在这里不存在。
 #
+#   ★ 两条通道，同一份内容：actions/cache（快、7 天会被回收）
+#     + Release 备份（慢、永不过期）。主流程按 ①→② 的顺序恢复，
+#     这里预热时也两条都写，保证任一时刻两边都有东西可取。
+#
 #   它的两个用途：
 #     1) 冷启动：主流程第一次跑不必现编工具链
 #     2) 保活：定时跑一次，相当于给缓存做一次 restore（刷新 lastAccessedAt），
@@ -51,17 +55,28 @@ on:
         options:
           - 'false'
           - 'true'
+      release_backup:
+        description: '同时存一份到 Release 备份（与主流程同一个 release）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
   schedule:
     # 每周一 03:17（UTC）—— 兼作缓存保活，别删
     - cron: '17 3 * * 1'
 
 permissions:
-  contents: read
+  # 需要 contents: write 才能创建 release / 传资产；actions: write 才能 gh cache delete
+  contents: write
   actions: write
 
 env:
   BUILD_ROOT: /workdir
   CACHE_ROOT: /workdir/openwrt
+  CACHE_RELEASE: cache-backup
+  RELEASE_BACKUP: ${{ github.event.inputs.release_backup == 'false' && 'false' || 'true' }}
   SOURCE: ${{ github.event.inputs.source || 'pbs05/ponwrt' }}
   REPO_URL: ${{ github.event.inputs.source == 'fork' && 'https://github.com/qwe3017/ponwrt' || 'https://github.com/pbs05/ponwrt' }}
   REPO_BRANCH: ${{ github.event.inputs.branch || 'master' }}
@@ -188,13 +203,59 @@ jobs:
             ${{ env.CACHE_ROOT }}/staging_dir/host*
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
+      - name: Restore cache from Release backup
+        id: release-restore
+        if: >-
+          env.IGNORE_CACHE != 'true'
+          && env.RELEASE_BACKUP == 'true'
+          && steps.cache-restore.outputs.cache-matched-key == ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$CACHE_ROOT"
+          PREFIX="${{ steps.cache-key.outputs.prefix }}"
+
+          if ! gh release view "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "Release $CACHE_RELEASE 不存在（首次运行）"
+            exit 0
+          fi
+
+          ASSET=$(gh release view "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" \
+                    --json assets -q '.assets[] | "\(.createdAt) \(.name)"' 2>/dev/null \
+                  | grep " ${PREFIX}-" | sort -r | head -1 | awk '{print $2}')
+          if [ -z "$ASSET" ]; then
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "Release 里没有 ${PREFIX}-* 的备份"
+            exit 0
+          fi
+
+          echo "从 Release 取备份: $ASSET"
+          which unzstd >/dev/null 2>&1 || sudo -E apt-get -yqq install zstd >/dev/null 2>&1 || true
+
+          if gh release download "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" -p "$ASSET" -D . \
+             && bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" unpack "$CACHE_ROOT" "./$ASSET"; then
+            rm -f "./$ASSET"
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 已从 Release 备份恢复: $ASSET"
+          else
+            rm -f "./$ASSET"
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Release 备份恢复失败，走真编译"
+          fi
+
       - name: Prepare restored build cache
-        if: env.IGNORE_CACHE != 'true' && steps.cache-restore.outputs.cache-matched-key != ''
+        if: >-
+          env.IGNORE_CACHE != 'true'
+          && (steps.cache-restore.outputs.cache-matched-key != ''
+              || steps.release-restore.outputs.restored == 'true')
         env:
           RESTORED_FROM: ${{ steps.cache-restore.outputs.cache-matched-key }}
         run: |
           cd "$CACHE_ROOT"
-          echo "恢复自: $RESTORED_FROM"
+          echo "actions/cache 恢复自: ${RESTORED_FROM:-（无）}"
+          echo "Release 备份恢复: ${{ steps.release-restore.outputs.restored }}"
           bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" prepare "$CACHE_ROOT"
 
       - name: Update & install feeds
@@ -259,7 +320,8 @@ jobs:
       - name: Download toolchain sources
         if: >-
           env.IGNORE_CACHE == 'true'
-          || steps.cache-restore.outputs.cache-matched-key == ''
+          || (steps.cache-restore.outputs.cache-matched-key == ''
+              && steps.release-restore.outputs.restored != 'true')
         run: |
           cd "$CACHE_ROOT"
           for i in 1 2 3; do
@@ -274,7 +336,8 @@ jobs:
         id: toolchain
         if: >-
           env.IGNORE_CACHE == 'true'
-          || steps.cache-restore.outputs.cache-matched-key == ''
+          || (steps.cache-restore.outputs.cache-matched-key == ''
+              && steps.release-restore.outputs.restored != 'true')
         run: |
           cd "$CACHE_ROOT"
           make tools/install -j"$(nproc)" || make tools/install -j1 V=s || {
@@ -297,6 +360,50 @@ jobs:
             ${{ env.CACHE_ROOT }}/.ccache
             ${{ env.CACHE_ROOT }}/staging_dir/host*
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
+
+      - name: Save cache to Release backup
+        if: >-
+          env.RELEASE_BACKUP == 'true'
+          && success()
+          && steps.cache-restore.outputs.cache-hit != 'true'
+          && steps.toolchain.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$CACHE_ROOT"
+          KEY="${{ steps.cache-key.outputs.key }}"
+          PREFIX="${{ steps.cache-key.outputs.prefix }}"
+          TARBALL="${KEY}.tzst"
+
+          which zstd >/dev/null 2>&1 || sudo -E apt-get -yqq install zstd >/dev/null 2>&1 || true
+
+          if ! bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" pack "$CACHE_ROOT" "$CACHE_ROOT/$TARBALL"; then
+            echo "::warning::打包失败，跳过 Release 备份"; exit 0
+          fi
+
+          SZ=$(stat -c%s "$TARBALL")
+          if [ "$SZ" -gt 2000000000 ]; then
+            echo "::warning::${SZ} 字节超过 2 GiB，跳过备份"; rm -f "$TARBALL"; exit 0
+          fi
+
+          gh release view "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" \
+              --title "Build Cache Backup" \
+              --notes "整体构建缓存的长期备份，由 build-ponwrt / warm-cache 自动维护，请勿手动删除。" \
+              --latest=false || true
+
+          gh release upload "$CACHE_RELEASE" "$TARBALL" --repo "$GITHUB_REPOSITORY" --clobber
+
+          gh release view "$CACHE_RELEASE" --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[] | "\(.createdAt) \(.name)"' 2>/dev/null \
+            | grep " ${PREFIX}-" | awk '{print $2}' | grep -vx "$TARBALL" \
+            | while read -r old; do
+                echo "删除旧备份: $old"
+                gh release delete-asset "$CACHE_RELEASE" "$old" --repo "$GITHUB_REPOSITORY" -y 2>/dev/null || true
+              done
+
+          rm -f "$TARBALL"
 
       - name: Cache status
         if: always()
@@ -322,8 +429,8 @@ jobs:
             echo "### Warm Cache — ${{ matrix.soc }}"
             echo ""
             echo "- key: \`${{ steps.cache-key.outputs.key }}\`"
-            echo "- 命中: ${{ steps.cache-restore.outputs.cache-matched-key || '无' }}"
-            echo "- 精确命中: ${{ steps.cache-restore.outputs.cache-hit || 'false' }}"
+            echo "- actions/cache 命中: ${{ steps.cache-restore.outputs.cache-matched-key || '无' }}"
+            echo "- Release 备份恢复: ${{ steps.release-restore.outputs.restored || 'false' }}"
             echo "- 编译工具链: ${{ steps.toolchain.outcome }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
