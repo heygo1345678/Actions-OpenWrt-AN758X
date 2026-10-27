@@ -112,6 +112,21 @@ jobs:
       fail-fast: false
       max-parallel: 10
     steps:
+      # =========================================================
+      # ★ path 指向的目录必须【在本 job 内】先创建。
+      #
+      #   touch 是独立 job，与 enum 不共享文件系统 ——
+      #   enum 里 mkdir 的 /tmp/dummy 在这里根本不存在。
+      #   actions/cache 对一个不存在的 path 行为未定义，
+      #   很可能是「精确 key 匹配却仍报 not found」的直接原因
+      #   （主流程能命中，保活却一直 miss，差别就在这里）。
+      # =========================================================
+      - name: Prepare path
+        run: |
+          mkdir -p /tmp/keepalive
+          echo "分支: ${GITHUB_REF_NAME} / 默认分支: ${{ github.event.repository.default_branch }}"
+          echo "目标 key: ${{ matrix.key }}"
+
       - name: Touch ${{ matrix.key }}
         id: t
         uses: actions/cache/restore@v5
@@ -127,7 +142,12 @@ jobs:
           HIT='${{ steps.t.outputs.cache-hit }}'
           case "$HIT" in
             true) echo "✅ 命中并已刷新访问时间" ;;
-            *)    echo "::warning::未命中 —— 检查该 key 是否属于当前分支" ;;
+            *)
+              echo "::warning::未命中。可能原因（按概率）："
+              echo "::warning::1) 缓存建在别的分支 —— actions/cache 只能读当前/上游/默认分支"
+              echo "::warning::2) key 与 Caches 页面显示的不完全一致（对比一下尾号）"
+              echo "::warning::3) 该条目已被 7 天规则回收（gh 列表有延迟）"
+              ;;
           esac
           du -sh /tmp/keepalive 2>/dev/null || true
 
