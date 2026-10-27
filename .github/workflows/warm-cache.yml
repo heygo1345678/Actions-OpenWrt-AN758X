@@ -95,6 +95,8 @@ env:
   FORCE_REBUILD: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
   IGNORE_CACHE: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
   USE_CCACHE: false
+  # 与主流程一致：ccache 上限，别让它把 10GB 配额吃光
+  CCACHE_MAXSIZE: 2G
   TZ: Asia/Shanghai
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 

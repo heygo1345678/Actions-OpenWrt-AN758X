@@ -19,6 +19,11 @@ env:
   UPLOAD_RELEASE: ${{ github.event.inputs.upload_release || 'true' }}
   USE_DL_CACHE: true
   USE_CCACHE: false
+  # ccache 的上限：源码基座配置里 CONFIG_CCACHE=y，所以它一直在生效
+  # （日志里 CC="ccache aarch64-openwrt-linux-musl-gcc"）。
+  # 不设上限它会一路长，把 actions/cache 的 10GB 配额吃光 ——
+  # 而配额被挤掉的正是工具链缓存。2G 对单套配置足够。
+  CCACHE_MAXSIZE: 2G
 
   # =========================================================
   # host 侧 go / rust / llvm 怎么来
