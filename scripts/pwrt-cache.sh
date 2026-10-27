@@ -182,6 +182,35 @@ pack)
     [ -e "$f" ] && echo "$f" >> "$LIST"
   done
 
+  # ===============================================================
+  # ★ build_dir 里 host 侧的 stamp —— 漏了它等于缓存白命中
+  #
+  #   OpenWrt 的 host 包是四级 stamp 链：
+  #     .prepared*     (源码已解压打补丁)
+  #       └ .configured*  (已 configure)
+  #           └ .built     (已编译)   ← make 是否重编就看这个
+  #               └ staging_dir/*/stamp/.<pkg>_installed  (已安装)
+  #
+  #   .built 位于 build_dir/<host 目录>/<pkg>/.built —— 不在 staging_dir。
+  #   只恢复 staging_dir 的话，_installed 虽然在，但它依赖的 .built 没了，
+  #   make 判定「需要先重建 .built」→ 从头编译一遍。
+  #   现象就是：日志显示 Cache restored successfully(639MB)，
+  #   随后 Compile the firmware 里仍然 make[3] -C tools/... compile 全跑一遍。
+  #
+  #   stamp 是空文件，几十字节，收它几乎没有体积代价；
+  #   真正大的源码树仍然不收（见下方说明）。
+  #
+  #   ⚠ 范围必须限定在 host 侧三个目录。
+  #     build_dir/target-*/ 下还有固件包的 stamp，那些每次都要重编，
+  #     收进去会导致固件不重新编译 —— 那是错的。
+  # ===============================================================
+  for base in build_dir/host build_dir/hostpkg build_dir/target-*/host; do
+    [ -d "$base" ] || continue
+    find "$base" -maxdepth 2 -type f \
+      \( -name '.built' -o -name '.prepared*' -o -name '.configured*' \) \
+      2>/dev/null >> "$LIST"
+  done
+
   if [ ! -s "$LIST" ]; then
     echo "::warning::staging_dir 里没有可打包的内容"
     rm -f "$LIST"; exit 0
@@ -251,6 +280,14 @@ unpack)
   #   缓存等于白命中。这一步是整个方案生效的关键。
   # -------------------------------------------------------------
   find staging_dir -path '*/stamp/*' -type f -exec touch {} + 2>/dev/null || true
+  # ★ build_dir 里恢复出来的 stamp 也要 touch，且必须比源码树新 ——
+  #   否则 make 仍判定「源码比 .built 新」而重编，缓存照样白命中。
+  for base in build_dir/host build_dir/hostpkg build_dir/target-*/host; do
+    [ -d "$base" ] || continue
+    find "$base" -maxdepth 2 -type f \
+      \( -name '.built' -o -name '.prepared*' -o -name '.configured*' \) \
+      -exec touch {} + 2>/dev/null || true
+  done
   find staging_dir/host/bin staging_dir/hostpkg/bin \
        staging_dir/target-*/host/bin staging_dir/toolchain*/bin \
        -type f -exec touch {} + 2>/dev/null || true
