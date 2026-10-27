@@ -1200,8 +1200,13 @@ jobs:
       # =========================================================
       - name: Save build cache (right after toolchain)
         id: save-early
+        # ⚠ 这里【不能】用 success()：
+        #   紧随其后的「Build host go/rust from source」最长 200 分钟，
+        #   一旦它失败或超时，success() 就变 false —— 连已经编好的
+        #   tools/toolchain 也一起丢了，等于白跑 1.5 小时。
+        #   用 !cancelled()：只要没被手动取消就存，编译失败也保住成果。
         if: >-
-          success()
+          (!cancelled())
           && steps.toolchain.outcome == 'success'
           && steps.cache-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5

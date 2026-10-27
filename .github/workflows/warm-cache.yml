@@ -414,7 +414,7 @@ jobs:
           env.RELEASE_BACKUP == 'true'
           && success()
           && steps.cache-restore.outputs.cache-hit != 'true'
-          && steps.toolchain.outcome == 'success'
+          && (steps.toolchain.outcome == 'success' || steps.host-src.outcome == 'success')
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
