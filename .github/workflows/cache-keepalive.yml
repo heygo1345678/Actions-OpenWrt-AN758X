@@ -59,12 +59,13 @@ jobs:
                  | "\(.createdAt)\t\(.sizeInBytes/1048576|floor)MB\t\(.key)"' all.json \
             | sort -r
 
-          # 前缀 = key 去掉末尾的 40 位提交号
-          # 例：ponwrt-pbs05-ponwrt-master-an7581-<sha40> → ponwrt-pbs05-ponwrt-master-an7581
-          # 让脚本按这个分组取最新，避免在这里重复实现前缀算法
+          # 「同族」判定与 scripts/cache-roll.jq 一致：
+          #   工具链缓存去掉末尾 40 位提交号、dl 缓存去掉末尾 6 位周号。
+          #   每族只取最新一条去恢复 —— 把每条历史 dl（2~5 GB）都下下来
+          #   纯属浪费，它们互为超集。
           KEYS=$(jq -r '
             [ .[] | select(.key | startswith("ponwrt-")) ]
-            | group_by(.key | sub("-[0-9a-f]{40}$"; ""))
+            | group_by(.key | sub("-[0-9a-f]{40}$"; "") | sub("-[0-9]{6}$"; ""))
             | map(sort_by(.createdAt) | last | .key)
             | .[]' all.json)
 
@@ -105,10 +106,15 @@ jobs:
       - name: Prepare paths
         run: |
           echo "目标 key: ${{ matrix.key }}"
-          mkdir -p /workdir/openwrt/.ccache \
-                   /workdir/openwrt/staging_dir/host \
-                   /workdir/openwrt/staging_dir/hostpkg \
-                   /workdir/openwrt/staging_dir/toolchain
+          # ⚠ 必须 sudo：/workdir 建在根目录下，runner 用户没有 / 的写权限
+          #   （不加就是 "mkdir: cannot create directory '/workdir': Permission denied"，
+          #    整个保活 job 直接红）。缓存写入时的绝对路径是 /workdir/openwrt/...，
+          #   restore 只会往这个路径解压，所以目录必须【在这里】就建好并交给 $USER。
+          sudo mkdir -p /workdir/openwrt/.ccache \
+                        /workdir/openwrt/staging_dir/host \
+                        /workdir/openwrt/staging_dir/hostpkg \
+                        /workdir/openwrt/staging_dir/toolchain
+          sudo chown -R "$USER":"$USER" /workdir
 
       - name: Restore ${{ matrix.key }}
         id: t

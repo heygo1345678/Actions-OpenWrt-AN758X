@@ -183,6 +183,16 @@ diy 脚本都不进 key。上游一提交就换一代，恢复时靠 `restore-ke
 2. 写 `tmp/.build` —— 标记「构建环境已初始化」，否则 make 重走 prereq 阶段
 3. 目录本身也 touch —— 避免「目录比内容旧」
 
+### dl 缓存（源码包）
+
+单独一条，key 按**周**滚动：`ponwrt-dl-<源站>-<分支>-<YYYYWW>`，同样是前缀回退。
+
+- 保存位置在**编译之前**（`make download` 跑完就存）—— 因为 350 分钟超时会把 job
+  直接 cancel，放最后用 `always()` 也来不及跑，几个 G 的 dl 就白下了
+- 只在 `make download` 真跑成功时存，避免一份只含工具链源码的残缺 dl 占掉本周的 key
+- 轮换时 **dl 也参与**：按周号分组、只留最新一代。dl 是「只增不减」的，
+  新一代必定是旧一代的超集，留旧的只会白占 10GB 配额、把工具链缓存挤出去
+
 配套的四个工作流：
 
 | 工作流 | 作用 |
@@ -190,7 +200,7 @@ diy 脚本都不进 key。上游一提交就换一代，恢复时靠 `restore-ke
 | `build-ponwrt.yml` | ①→② 恢复 → 编译 → **成功后两处都存** → `cache-rollover` job 删掉同前缀的旧代 |
 | `warm-cache.yml` | 每周一预热/保活；key 口径与主流程同源（都调 `scripts/pwrt-cache.sh`） |
 | `cache-keepalive.yml` | 每 3 天真实恢复一次，避开 7 天未访问回收 |
-| `cache-clean.yml` | 手动/定时清理：`rollover` 只留最新一代（默认，不动 dl），`all` 全删 |
+| `cache-clean.yml` | 手动/定时清理：`rollover` 每个族只留最新一代（工具链按提交号、dl 按周号分组）、`backup` 清 Release 旧代、`all` 全删 |
 
 `ignore_cache=true` 会跳过恢复强制重编（仍会存新一代）。
 

@@ -14,9 +14,9 @@ name: Cache Clean
 #     prefix    只删指定前缀下的全部条目
 #     all       全删，连 Release 备份一起删（等价上游的 gh cache delete --all，慎用）
 #
-#   ⚠ 无论哪种模式，dl 缓存（ponwrt-dl-*）都不在默认清理范围：
-#     它是纯增量下载缓存，越老越有用，删了等于白白重下几个 G。
-#     真要删请在 mode=all 时手动确认。
+#   ★ dl 缓存也参与 rollover，但只留最新一代 —— 它是只增不减的，
+#     新一轮的 dl 必定是上一轮的超集（先恢复前缀、再 make download 补齐、
+#     最后整份存回去）。留旧的只会白占 10GB 配额，把工具链缓存挤出去。
 # =========================================================
 
 on:
@@ -36,14 +36,6 @@ on:
         description: 'mode=prefix 时要删的前缀（如 ponwrt-pbs05-ponwrt-master-an7581）'
         required: false
         default: ''
-      include_dl:
-        description: '是否连 dl 缓存一起清理（默认不动 dl）'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
   schedule:
     # 每周一 04:20（UTC）做一次轮换；只删旧代，不会让缓存归零
     - cron: '20 4 * * 1'
@@ -60,7 +52,6 @@ jobs:
       CACHE_RELEASE: cache-backup
       MODE: ${{ github.event.inputs.mode || 'rollover' }}
       PREFIX: ${{ github.event.inputs.prefix || '' }}
-      INCLUDE_DL: ${{ github.event.inputs.include_dl || 'false' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -162,13 +153,13 @@ jobs:
               gh cache list -R "$GITHUB_REPOSITORY" --limit 200 \
                 --json id,key,createdAt > all.json
 
-              # 前缀 = key 去掉末尾 40 位提交号；每组只保留 createdAt 最新的那个，
-              # 其余全部删除。
+              # 「代」的划分见 scripts/cache-roll.jq 头部注释：
+              #   工具链缓存去掉末尾 40 位提交号、dl 缓存去掉末尾 6 位周号，
+              #   每组只保留 createdAt 最新的那个，其余全部删除。
               # ⚠ jq 程序放在 scripts/cache-roll.jq：写在这个 run 块里做不了 ——
               #   heredoc 的结束标记必须顶格，而 YAML 的 block scalar 要求
               #   所有行都带缩进，两者直接冲突（解析直接报 could not find ':'）。
-              jq -r --argjson include_dl "$INCLUDE_DL" \
-                -f "$GITHUB_WORKSPACE/scripts/cache-roll.jq" all.json > del.tsv
+              jq -r -f "$GITHUB_WORKSPACE/scripts/cache-roll.jq" all.json > del.tsv
 
               if [ ! -s del.tsv ]; then
                 echo "没有需要清理的旧代"

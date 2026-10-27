@@ -721,11 +721,22 @@ jobs:
           exit "$FAIL"
 
       # =========================================================
-      # 3. dl 下载缓存
+      # 3. dl 下载缓存（源码包，2~5 GB，长期累计）
+      #
+      #   ⚠ 原来用 actions/cache@v5 的 save-always，指望「编译失败也保住
+      #     dl」。但查了 v5 的 action.yml：save-always 已标记 deprecated，
+      #     原文是「does not work as intended」，实际仍走 post 步骤的
+      #     post-if: success() —— 也就是说构建一失败，这一趟下的几个 G
+      #     全白下。所以改成显式的 restore + save 两步。
+      #
+      #   key 按周滚动、restore-keys 前缀回退：dl 是【只增不减】的，
+      #   每周那份都是上一周的超集，所以轮换时只留最新一份就够
+      #   （见 scripts/cache-roll.jq 对 -YYYYWW 后缀的处理）。
       # =========================================================
-      - name: Cache dl directory
+      - name: Restore dl cache
+        id: dl-restore
         if: env.USE_DL_CACHE == 'true'
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: /workdir/openwrt/dl
@@ -735,8 +746,6 @@ jobs:
           key: ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-${{ steps.resolve.outputs.week }}
           restore-keys: |
             ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-
-          # 关键：即使后面编译失败也要保住已下载的源码包
-          save-always: true
 
       # =========================================================
       # 4. 更新并安装 Feeds
@@ -1169,6 +1178,34 @@ jobs:
           find dl -size -1024c -type f -exec ls -l {} \; 2>/dev/null
           find dl -size -1024c -type f -exec rm -f {} \; 2>/dev/null
           echo "dl 目录共 $(ls -1 dl 2>/dev/null | wc -l) 个文件"
+
+      # =========================================================
+      # 17.5 存 dl 缓存
+      #
+      #   ★ 位置很关键：放在【编译之前】。
+      #     放到最后用 always() 也能覆盖「编译失败」，但覆盖不了
+      #     「超时被取消」—— 350 分钟一到，job 被 cancel，后面所有
+      #     步骤（含 always()）都来不及跑，几个 G 的 dl 白下。
+      #     这个仓库是手动编译、很容易跑到超时，所以宁可在这里存。
+      #
+      #   代价：编译阶段才下载的零星文件这轮不会进缓存，下次
+      #   `make download` 会补上 —— 相比丢整份 dl，可以忽略。
+      #
+      #   ⚠ 只在 package 步真跑成功时存（toolchain-only 不算）：
+      #     否则一份只含工具链源码的残缺 dl 会占掉本周的 key，
+      #     同周后续 firmware 运行命中的就是这份残缺内容。
+      # =========================================================
+      - name: Save dl cache
+        if: >-
+          success()
+          && env.USE_DL_CACHE == 'true'
+          && steps.dl-restore.outputs.cache-hit != 'true'
+          && steps.package.outcome == 'success'
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          key: ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-${{ steps.resolve.outputs.week }}
+          path: /workdir/openwrt/dl
 
       # =========================================================
       # 18. 编译固件
