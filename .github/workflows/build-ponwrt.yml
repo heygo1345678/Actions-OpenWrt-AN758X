@@ -590,14 +590,9 @@ jobs:
         continue-on-error: true
         uses: actions/create-github-app-token@v3
         with:
-          # app-id 在 v3 里仍然合法 —— README 原文：
-          #     The legacy `app-id` input is also accepted, but `client-id` is recommended.
-          # 也就是说功能不受影响，只是会在日志里多一条 deprecation 提示。
-          #
-          # 想把这条提示去掉：App 设置页抄「Client ID」（★ 不是 App ID，
-          # 两者数值不同），存成 secrets.PRIVATE_SOURCE_APP_CLIENT_ID，再把
-          # 下面这行换成 client-id: ${{ secrets.PRIVATE_SOURCE_APP_CLIENT_ID }}
+
           app-id: ${{ secrets.PRIVATE_SOURCE_APP_ID }}
+          client-id: ${{ secrets.PRIVATE_SOURCE_APP_CLIENT_ID }}
           private-key: ${{ secrets.PRIVATE_SOURCE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           permission-contents: read
