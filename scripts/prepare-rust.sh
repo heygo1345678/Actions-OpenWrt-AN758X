@@ -144,7 +144,11 @@ if ! grep -Fxq "$MARKER" "$RUST_MAKEFILE"; then
   warn "Rust: 注入 ci-prebuilt.mk 失败，退回源码自举"
   exit 0
 fi
-log "注入: $MARKER（在 $(eval \$(call HostBuild)) 之前）"
+# ⚠ 别把 $HOSTBUILD 直接放进带 $(...) 的字符串：
+#   它的内容是字面量 $(eval $(call HostBuild))，
+#   双引号里的 $(...) 会被 shell 当命令替换执行，
+#   直接报 "意外令牌附近语法错误 '('"（第147行就是这么炸的）。
+log "注入: $MARKER（在 HostBuild 求值之前）"
 
 "$RUST_ROOT/bin/rustc" --version | tee -a "$REPORT"
 log "✅ 使用 runner 的 Rust（$RUST_TOOLCHAIN），跳过源码自举（省 30~60 分钟）"

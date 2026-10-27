@@ -226,10 +226,23 @@ pack)
   #   展开后才有 bin/rustc 这样的路径，grep 列表会漏报。
   # ---------------------------------------------------------------
   for want in go rustc; do
-    if find staging_dir -path "*/bin/$want" -type f 2>/dev/null | grep -q .; then
+    # ⚠ 必须同时接受符号链接（-type l）。
+    #   rust-prebuilt.mk 的 Host/Install 用的是 ln -sfn，
+    #   产物是【符号链接】而不是普通文件；只查 -type f 会漏掉它，
+    #   明明注入成功了却报「没有 rustc」。
+    HITS=$(find staging_dir -path "*/bin/$want" \( -type f -o -type l \) 2>/dev/null)
+    if [ -z "$HITS" ]; then
+      echo "::warning::staging_dir 里没有 $want —— 缓存不完整，下次该栈会重新编译"
       continue
     fi
-    echo "::warning::staging_dir 里没有 $want —— 缓存不完整，下次该栈会重新编译"
+    # 符号链接还要确认没悬空：它指向 runner 的 rustup sysroot，
+    # 若下次运行没先跑 prepare-rust.sh，目标就不存在。
+    DANGLE=0
+    while IFS= read -r f; do
+      [ -e "$f" ] || DANGLE=1
+    done <<< "$HITS"
+    [ "$DANGLE" = "1" ] && \
+      echo "::warning::$want 是悬空符号链接 —— 目标不在缓存里，需先跑 prepare-rust.sh"
   done
 
   # ---------------------------------------------------------------

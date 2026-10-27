@@ -61,19 +61,28 @@ if [ -z "$GO_ROOT" ] || [ ! -x "$GO_ROOT/bin/go" ]; then
   warn "Go: runner 没有可用的 go，跳过 external bootstrap"
 else
   # 能力检测：feed 的 Config.in 里必须真的有这几个符号
-  GO_CFG=""
-  for c in feeds/packages/lang/golang/Config.in \
-           feeds/packages/lang/golang/golang/Config.in \
-           package/feeds/packages/golang/Config.in; do
-    [ -f "$c" ] && { GO_CFG="$c"; break; }
-  done
+  #
+  #   ⚠ 不能写死几个固定路径 —— 各版本 feed 的目录结构不一样：
+  #     feeds/packages/lang/golang/Config.in
+  #     feeds/packages/lang/golang/golang/Config.in
+  #     feeds/packages/lang/golang/golang-values/Config.in …
+  #   写死就会出现「找不到 golang 的 Config.in」而白白错过加速。
+  #   这里在整个源码树里搜任何含该符号的 Config.in。
+  GO_CFG=$(grep -rl 'GOLANG_BUILD_BOOTSTRAP' --include='Config.in' . 2>/dev/null | head -1)
 
   if [ -z "$GO_CFG" ]; then
-    warn "Go: 找不到 golang 的 Config.in，跳过"
-  elif ! grep -q 'GOLANG_BUILD_BOOTSTRAP' "$GO_CFG" \
-     || ! grep -q 'GOLANG_EXTERNAL_BOOTSTRAP_ROOT' "$GO_CFG"; then
-    warn "Go: 该 feed 不支持 external bootstrap，仍会走五段自举"
+    # 再退一步：Makefile 里定义也算（有些 feed 不用 Kconfig）
+    GO_CFG=$(grep -rl 'GOLANG_EXTERNAL_BOOTSTRAP_ROOT' \
+             --include='*.mk' --include='Makefile' . 2>/dev/null | head -1)
+  fi
+
+  if [ -z "$GO_CFG" ]; then
+    warn "Go: 全树搜不到 GOLANG_BUILD_BOOTSTRAP 符号，跳过（将走源码自举）"
+    echo "  提示: 可手动确认 ls feeds/packages/lang/golang/"
+  elif ! grep -q 'GOLANG_EXTERNAL_BOOTSTRAP_ROOT' "$GO_CFG"; then
+    warn "Go: $GO_CFG 有 BUILD_BOOTSTRAP 但没有 EXTERNAL_BOOTSTRAP_ROOT，仍会走五段自举"
   else
+    log "Go     : 符号定义于 $GO_CFG"
     set_cfg CONFIG_GOLANG_BUILD_BOOTSTRAP ""
     set_cfg CONFIG_GOLANG_EXTERNAL_BOOTSTRAP_ROOT "\"$GO_ROOT\""
     GO_DONE=1
