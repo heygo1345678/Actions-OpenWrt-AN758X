@@ -547,26 +547,26 @@ jobs:
             rel=$(find -L package -maxdepth 4 -type d -name "$p" 2>/dev/null | head -1)
             [ -z "$rel" ] && { echo "::warning::树里没有 $p，跳过"; continue; }
             # =========================================================
-            # ★ 必须 host/install，不能只 host/compile
+            # ★ 只能写 host/compile —— 没有 host/install 这个目标
             #
-            #   OpenWrt 的 HostBuild 里 compile 与 install 是两个独立目标，
-            #   host/compile 只跑到 Host/Compile 为止，【不会】调用 Host/Install。
+            #   实测 make package/.../host/install 直接报：
+            #     No rule to make target 'package/.../host/install'
             #
-            #   而 rust-prebuilt.mk 的符号链接正是写在 Host/Install 里：
-            #     ln -sfn "$(CI_RUST_ROOT)/bin/rustc" $(STAGING_DIR)/host/bin/rustc
+            #   实际上也不需要它：host-build.mk 的依赖链是
+            #     host-compile: $(HOST_STAMP_INSTALLED)
+            #     $(HOST_STAMP_INSTALLED): $(HOST_STAMP_BUILT)
+            #         $(call Host/Install)
+            #   即 host-compile 会自动走到 Host/Install。
             #
-            #   所以只跑 host/compile 的结果是：
-            #     .built 生成了、日志一片成功、缓存也打了包，
-            #     但 staging_dir 里根本没有 rustc ——
-            #     "rust: make 返回 0，但 staging_dir 里没有 rustc"。
-            #
-            #   host/install 依赖 host/compile，一次跑完即可。
+            #   之前那句「make 返回 0 但没有 rustc」其实是【误报】——
+            #   rust-prebuilt.mk 用 ln -sfn 安装，产物是符号链接，
+            #   而校验用的 find -type f 匹配不到符号链接。
             # =========================================================
-            echo "===== make $rel/host/install ====="
+            echo "===== make $rel/host/compile ====="
             make "$rel/download" >/dev/null 2>&1 || true
             # 不加 V=s：golang bootstrap 有 9000+ 个包，会刷上万行日志
-            make "$rel/host/install" -j"$JOBS" || make "$rel/host/install" -j1 V=s || \
-              echo "::warning::$p host 安装失败（其余继续）"
+            make "$rel/host/compile" -j"$JOBS" || make "$rel/host/compile" -j1 V=s || \
+              echo "::warning::$p host 编译失败（其余继续）"
 
             # 落地校验：make 返回 0 不等于真编出了东西。
             #   包已 installed、没有 HostBuild、target 名对不上，make 都会安静返回 0。
@@ -580,7 +580,8 @@ jobs:
             HITS=$(find staging_dir -path "*/bin/$BIN" \( -type f -o -type l \) 2>/dev/null)
             if [ -z "$HITS" ]; then
               echo "::warning::$p: make 返回 0，但 staging_dir 里没有 $BIN"
-              echo "::warning::$p: 两个常见原因 —— (1) 只跑了 host/compile 漏了 host/install；(2) 产物是符号链接"
+              echo "::warning::$p: 常见原因 —— 产物是符号链接（查 -type f 会漏，这里已兼容）"
+              echo "::warning::$p:            —— 或该包没有 HostBuild / target 名对不上"
             else
               echo "✅ $p 产物已就位"
               # 悬空检测：符号链接指向 runner 的 rustup sysroot，
