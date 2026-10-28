@@ -93,9 +93,11 @@ staging_dir/tool*      交叉编译器
 `staging_dir/host/stamp/.tools_compile_<flags>` 和 `staging_dir/toolchain-*/stamp/.toolchain_compile`，
 这两个戳存在且比源码树新，`tools/compile` 与 `toolchain/compile` 就整段跳过。
 
-所以 `prepare` 只在 **actions/cache 精确命中**（同一提交）时才保留这两个戳；前缀回退
-和 Release 恢复都可能是别的提交、源码已变，脚本会删掉它们迫使 make 重编（约 26 分钟，
-ccache 会加速）。当前提交通常在第一次构建时付这 26 分钟，之后同提交重跑都是 0 分钟。
+**精确命中 = 这份缓存就是当前这个提交编出来的**，两条通道都算：`actions/cache` 的
+`cache-hit=true`，或 Release 资产名去掉 `.tzst` 后与本次 key 完全相同。只有精确命中时
+`prepare` 才保留这两个戳；前缀回退、或 Release 取到的是旧代，都说明源码已变，脚本会删掉
+它们迫使 make 重编（约 26 分钟，ccache 会加速）。当前提交通常在第一次构建时付这 26 分钟，
+之后同提交重跑都是 0 分钟。
 
 | 通道 | 介质 | 特点 |
 |---|---|---|
