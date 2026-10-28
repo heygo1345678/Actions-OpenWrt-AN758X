@@ -291,7 +291,14 @@ jobs:
           # 若传入的 soc 与机型冲突，以机型为准
           echo "SOC=$SOC" >> "$GITHUB_ENV"
           echo "PROFILE=$PROFILE" >> "$GITHUB_ENV"
-          echo "DEVICE_NAME=ponwrt-${SOC}-${PROFILE}" >> "$GITHUB_ENV"
+          # 末尾带上 host 模式：source / prebuilt 两条线并行跑时，固件与
+          # artifact 不再互相覆盖。
+          # DEVICE_NAME 同时决定下面三处，改这一个地方就够：
+          #   · artifact 名 OpenWrt_firmware_${DEVICE_NAME}${FILE_DATE}
+          #   · Release tag  ${DEVICE_NAME}-${REPO_BRANCH}
+          #   · 旧 tag 清理   delete_tag_pattern: ^${DEVICE_NAME}-
+          # 固件文件名不受影响（前缀由 OpenWrt 的 CONFIG_VERSION_DIST 决定）。
+          echo "DEVICE_NAME=ponwrt-${SOC}-${PROFILE}-${HOST_MODE}" >> "$GITHUB_ENV"
           # 每机型一份 config；profile=all 时回退到 SoC 通用配置
           if [ "$PROFILE" = "all" ]; then
             echo "CONFIG_FILE=configs/${SOC}.config" >> "$GITHUB_ENV"
