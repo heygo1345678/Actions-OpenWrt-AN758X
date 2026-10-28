@@ -6,11 +6,16 @@ name: Build PonWrt (Airoha AN758x PON)
 # =========================================================
 env:
   BUILD_ROOT: /workdir
-  SOURCE: ${{ github.event.inputs.source || 'fork' }}
+  # ⚠ 回退值必须与 input 的 default 一致，不能写 'fork'：
+  #   repository_dispatch / API 触发时 github.event.inputs.* 全是空，
+  #   回退成 'fork' 就会走到下面 REPO_URL 的 fork 分支，
+  #   而「无输入触发」和「选默认值触发」应该是同一条路。
+  SOURCE: ${{ github.event.inputs.source || 'pbs05/ponwrt' }}
   # 唯一真相源：固件版本后缀的作者名（LuCI 概览页「固件版本」）
   # 由 fw_author 输入项覆盖，留空则 qwe
   FW_AUTHOR: ${{ github.event.inputs.fw_author || 'qwe' }}
-  REPO_URL: ${{ github.event.inputs.source == 'pbs05/ponwrt' && 'https://github.com/pbs05/ponwrt' || 'https://github.com/qwe3017/ponwrt' }}
+  # fork 分支指向 qwe-qaq/ponwrt（不是已 404 的 qwe3017/ponwrt）
+  REPO_URL: ${{ github.event.inputs.source == 'fork' && 'https://github.com/qwe-qaq/ponwrt' || 'https://github.com/pbs05/ponwrt' }}
   FEEDS_CONF: ''
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
@@ -203,6 +208,10 @@ on:
           - 'true'
           - 'false'
       prebuilt_host:
+        # 这里刻意保持 true/false 二选一：主流程一次只编一个固件，host 侧只能
+        # 有一种模式，「两个都跑」没有意义（那是 warm-cache 预热时才有的事）。
+        # 对应关系：这里的 true = warm-cache 的「预编译」，false = 「源码编」。
+        # HOST_MODE 会进缓存 key 前缀，两边映射到同一个 ASCII 值即可互通。
         description: 'Go/Rust/LLVM 用 runner 预编译（false = 全部从源码真实编译，首次 +1.5~2.5 小时）'
         required: false
         default: 'true'

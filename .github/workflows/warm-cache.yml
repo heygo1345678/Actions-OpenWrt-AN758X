@@ -27,14 +27,14 @@ on:
   workflow_dispatch:
     inputs:
       soc:
-        description: 'SoC（同 SoC 下所有机型共用一份缓存）'
+        description: '预热哪个 SoC（同 SoC 下所有机型共用一份缓存）'
         required: true
         default: 'an7581'
         type: choice
         options:
-          - an7581
-          - an7583
-          - both
+          - 'an7581'
+          - 'an7583'
+          - 'an7581和an7583'
       source:
         description: '编译源码仓库（需与主流程一致，否则前缀对不上）'
         required: true
@@ -56,13 +56,17 @@ on:
           - 'false'
           - 'true'
       prebuilt_host:
-        description: 'Go/Rust 用 runner 预编译（false = 从源码真实编译，与主流程保持一致）'
+        description: 'host 侧 go/rust/llvm 怎么来（必须与主流程一致，否则预热到另一条缓存线上）'
         required: false
-        default: 'true'
+        default: '预编译'
         type: choice
         options:
-          - 'true'
-          - 'false'
+          - '预编译'
+          - '源码编'
+          - '预编译和源码编'
+        # ⚠ 选「预编译和源码编」= 一次预热两条缓存线（HOST_MODE 进 key 前缀，
+        #   两条线互不通用）。代价：source 那条首次要 1.5~2.5 小时、
+        #   多占 1~2 GB 配额。只在你确实会在两种模式间切换时才选它。
       release_backup:
         description: '同时存一份到 Release 备份（与主流程同一个 release）'
         required: false
@@ -84,12 +88,13 @@ env:
   BUILD_ROOT: /workdir
   CACHE_ROOT: /workdir/openwrt
   CACHE_RELEASE: cache-backup
-  # 必须与主流程一致：HOST_MODE 进缓存前缀，两边不一致就永远命中不了
-  PREBUILT_HOST: ${{ github.event.inputs.prebuilt_host == 'false' && 'false' || 'true' }}
-  HOST_MODE: ${{ github.event.inputs.prebuilt_host == 'false' && 'source' || 'prebuilt' }}
+  # ⚠ PREBUILT_HOST / HOST_MODE 不再写在这里：它们由 build 矩阵的
+  #   matrix.host_mode 决定（一次可以同时预热 prebuilt + source 两条线）。
+  #   HOST_MODE 会进缓存 key 前缀，所以矩阵里只放 ASCII 的
+  #   prebuilt / source，中文选项在 prepare 里就映射掉了。
   RELEASE_BACKUP: ${{ github.event.inputs.release_backup == 'false' && 'false' || 'true' }}
   SOURCE: ${{ github.event.inputs.source || 'pbs05/ponwrt' }}
-  REPO_URL: ${{ github.event.inputs.source == 'fork' && 'https://github.com/qwe3017/ponwrt' || 'https://github.com/pbs05/ponwrt' }}
+  REPO_URL: ${{ github.event.inputs.source == 'fork' && 'https://github.com/qwe-qaq/ponwrt' || 'https://github.com/pbs05/ponwrt' }}
   REPO_BRANCH: ${{ github.event.inputs.branch || 'master' }}
   DIY_P1_SH: diy-part1.sh
   FORCE_REBUILD: ${{ github.event.inputs.force == 'true' && 'true' || 'false' }}
@@ -109,13 +114,48 @@ jobs:
       - name: Build matrix
         id: matrix
         run: |
-          case "${{ github.event.inputs.soc || 'an7581' }}" in
-            both)   LIST='["an7581","an7583"]' ;;
-            an7583) LIST='["an7583"]' ;;
-            *)      LIST='["an7581"]' ;;
+          SOC_IN="${{ github.event.inputs.soc }}"
+          MODE_IN="${{ github.event.inputs.prebuilt_host }}"
+
+          # 定时触发没有 inputs → 两个 SoC 都预热，但只跑预编译
+          # （源码编那趟 1.5~2.5 小时，不该每周自动烧）
+          [ -z "$SOC_IN" ]  && SOC_IN='an7581和an7583'
+          [ -z "$MODE_IN" ] && MODE_IN='预编译'
+
+          # 中文选项 → 矩阵用的 ASCII 标准值。
+          # HOST_MODE 会进缓存 key 前缀（scripts/pwrt-cache.sh:83），
+          # 中文经 slug() 会被 tr 转成一串连字符，两条线还会撞在一起，
+          # 所以必须在进矩阵之前映射干净。
+          case "$MODE_IN" in
+            '源码编')          HM='["source"]' ;;
+            '预编译和源码编')  HM='["prebuilt","source"]' ;;
+            '预编译')          HM='["prebuilt"]' ;;
+            # 兼容旧调用：gh workflow run -f prebuilt_host=false / both
+            false|source)     HM='["source"]' ;;
+            true|prebuilt)    HM='["prebuilt"]' ;;
+            both)             HM='["prebuilt","source"]' ;;
+            *)
+              echo "::warning::未知的 prebuilt_host=$MODE_IN，按预编译处理"
+              HM='["prebuilt"]'
+              ;;
           esac
-          echo "matrix={\"soc\":$LIST}" >> "$GITHUB_OUTPUT"
-          echo "SoC 列表: $LIST"
+
+          case "$SOC_IN" in
+            an7581)          LIST='["an7581"]' ;;
+            an7583)          LIST='["an7583"]' ;;
+            an7581和an7583)  LIST='["an7581","an7583"]' ;;
+            both)            LIST='["an7581","an7583"]' ;;
+            *)
+              echo "::warning::未知的 soc=$SOC_IN，按两个都跑"
+              LIST='["an7581","an7583"]'
+              ;;
+          esac
+
+          # 两个维度 → GitHub 自动做笛卡尔积：
+          #   an7581和an7583 × 预编译和源码编 = 4 个 job
+          echo "matrix={\"soc\":$LIST,\"host_mode\":$HM}" >> "$GITHUB_OUTPUT"
+          echo "SoC 列表 : $LIST"
+          echo "host 模式: $HM"
 
   build:
     needs: prepare
@@ -127,6 +167,10 @@ jobs:
       max-parallel: 2
     env:
       SOC: ${{ matrix.soc }}
+      # 由矩阵决定，一次运行可以同时跑 prebuilt 和 source 两条缓存线。
+      # job 级 env 优先级高于 workflow 级，所以不必再在顶层重复声明。
+      HOST_MODE: ${{ matrix.host_mode }}
+      PREBUILT_HOST: ${{ matrix.host_mode == 'prebuilt' && 'true' || 'false' }}
 
     steps:
       - name: Checkout
@@ -485,7 +529,9 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v5
         with:
-          name: warm-cache-${{ matrix.soc }}-${{ github.run_attempt }}
+          # ⚠ 名字里必须带 host_mode：矩阵现在有 soc × host_mode 两个维度，
+          #   只带 soc 会让两个 job 传同名 artifact 而互相冲突。
+          name: warm-cache-${{ matrix.soc }}-${{ matrix.host_mode }}-${{ github.run_attempt }}
           path: ${{ github.workspace }}/build-reports/
           retention-days: 7
 
@@ -493,7 +539,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "### Warm Cache — ${{ matrix.soc }}"
+            echo "### Warm Cache — ${{ matrix.soc }} / ${{ matrix.host_mode }}"
             echo ""
             echo "- key: \`${{ steps.cache-key.outputs.key }}\`"
             echo "- actions/cache 命中: ${{ steps.cache-restore.outputs.cache-matched-key || '无' }}"
@@ -506,19 +552,26 @@ jobs:
   #   ⚠ 单独成 job，不能并进 build：actions/cache/save 是收尾动作，
   #     紧跟着查有时还查不到新 key —— 会误判「没有当前代」而把唯一一份删了。
   cache-rollover:
-    name: Roll build cache (${{ matrix.soc }})
+    name: Roll build cache (${{ matrix.soc }} / ${{ matrix.host_mode }})
     needs: [prepare, build]
-    if: ${{ needs.build.result == 'success' }}
+    # ⚠ 不用 needs.build.result == 'success'：矩阵现在是 soc × host_mode，
+    #   只要 source 那条线超时，聚合结果就不是 success，prebuilt 那条已经
+    #   存好的新代就永远轮换不掉。脚本内部本来就有保护 —— 没给 KEY 时保留
+    #   「创建时间最新」的一代，当前代还没落库时直接跳过本轮，不会误删。
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     strategy:
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
       fail-fast: false
     concurrency:
-      group: ponwrt-cache-rollover-${{ github.ref }}-${{ matrix.soc }}
+      group: ponwrt-cache-rollover-${{ github.ref }}-${{ matrix.soc }}-${{ matrix.host_mode }}
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SOC: ${{ matrix.soc }}
+      # prefix 由 pwrt-cache.sh 现算，读的就是这个变量；
+      # 漏了它就会去清另一条线的缓存（甚至算出 prebuilt 的前缀去删 source 的）
+      HOST_MODE: ${{ matrix.host_mode }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
