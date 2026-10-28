@@ -144,13 +144,29 @@ cmd_prepare() {
   echo "已写入 tmp/.build"
 
   # 落地校验：host gcc / go 在不在，是判断这份缓存有没有用的最快指标
+  #
+  # ⚠ go 的检查必须同时认符号链接（-type f -o -type l）：
+  #   OpenWrt 的 staging_dir/host/bin/go 通常是指向
+  #   hostpkg/lib/go-<ver>/bin/go 的链接，只找 -type f 会漏掉，
+  #   于是一份完好的缓存被误报成「缺 go」。
   local miss=""
   [ -x staging_dir/host/bin/gcc ] || miss="$miss gcc"
-  find staging_dir -path '*/bin/go' -type f 2>/dev/null | grep -q . || miss="$miss go"
+
+  local go_hit
+  go_hit=$(find staging_dir -path '*/bin/go' \( -type f -o -type l \) 2>/dev/null | head -1)
+  [ -n "$go_hit" ] || miss="$miss go"
+
   if [ -n "$miss" ]; then
     echo "::warning::恢复出来的缓存缺:$miss —— host 工具链不完整，本次仍会补编"
+    # 把两个 host bin 目录列出来，下一次能直接看出是「真没有」还是「路径不对」
+    for d in staging_dir/host/bin staging_dir/hostpkg/bin; do
+      [ -d "$d" ] || continue
+      echo "  $d（前 15 项）:"
+      ls -1 "$d" 2>/dev/null | head -15 | sed 's/^/    /'
+    done
   else
     echo "✅ 缓存内容自检通过（gcc / go 均在）"
+    echo "   go: $go_hit"
   fi
 }
 
