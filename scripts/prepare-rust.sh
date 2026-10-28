@@ -1,19 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================
-# prepare-rust.sh —— 用 runner 的 rustup 替代 rustc 源码自举
+# prepare-rust.sh —— 用 runner 的 rustup 替代 rustc 源码自举（省 30~60 分钟）
 #
-#   参照 VIKINGYFY/OpenWRT-CI。
-#   省掉 rustc 从源码 bootstrap 的 30~60 分钟。
-#
-#   关键点：target triple 必须【向 feed 要】，不能自己拼。
-#     feeds/packages/lang/rust/rust-values.mk 里的 RUSTC_TARGET_ARCH
-#     就是 OpenWrt 用的映射，用它才能保证 CI 装的 target 与
-#     OpenWrt 期望的一致。
-#
-#   ★ 全部软失败：rustup 缺失 / feed 结构不同 / 目标装不上，
-#     都只 warning 并退回源码自举，不阻断构建。
-#
-#   用法: bash prepare-rust.sh <openwrt_dir>
+#   关键：target triple 必须向 feed 要、不能自己拼 —— 读
+#   feeds/packages/lang/rust/rust-values.mk 的 RUSTC_TARGET_ARCH，
+#   才能保证 CI 装的 target 与 OpenWrt 期望的一致。
+# ★ 全部软失败：rustup 缺失 / feed 结构不同 / 目标装不上，都只 warning 并
+#   退回源码自举。用法: bash prepare-rust.sh <openwrt_dir>
 # =============================================================
 
 set -uo pipefail
@@ -146,19 +139,10 @@ fi
 
 # ---------------------------------------------------------------
 # 4.5 纠正 staging_dir 里那三个「指向上次 runner」的符号链接
-#
-#   场景：构建缓存命中 → staging_dir/host/bin/rustc 是上一次运行留下的
-#   符号链接，指向 /home/runner/.rustup/toolchains/<toolchain>/bin/rustc。
-#
-#   正常情况下这个路径每次都一样，链接不会坏。但一旦镜像换了 rustup
-#   布局、或工具链名从 stable 变掉，它就是【悬空】的 —— 而
-#   Host/Install 只在 stamp 失效时才会重跑，不会自动帮我们修，
-#   于是 make 编译 Rust 包时报
-#     /bin/sh: .../staging_dir/host/bin/rustc: not found
-#   看起来像缓存坏了，其实是链接指错了地方。
-#
-#   这里直接就地改正：只动「符号链接」，源码自举出来的真实二进制不碰。
-#   成本为零，且让缓存恢复不再依赖 rustup 路径恰好稳定。
+#   缓存命中时 host/bin/rustc 是上次留下的链接，指向 /home/runner/.rustup/…。
+#   镜像换了 rustup 布局或工具链名，它就悬空；而 Host/Install 只在 stamp 失效
+#   时重跑、不会自己修，于是报 /bin/sh: .../staging_dir/host/bin/rustc: not found，
+#   看起来像缓存坏了。这里就地改正，只动符号链接、不碰真实二进制。
 # ---------------------------------------------------------------
 LINKED=0
 for d in "$PWD/staging_dir/host/bin" "$PWD/staging_dir/hostpkg/bin"; do
@@ -176,15 +160,9 @@ fi
 
 # ---------------------------------------------------------------
 # 4.6 版本对照：feed 期望的 rustc vs runner 实际提供的
-#
-#   这里用的是 runner 预装的 stable（省 30~60 分钟自举），代价是版本
-#   不一定等于 feeds/packages/lang/rust 里 pin 的那个。
-#
-#   功能上是等价的（产出的都是 aarch64-musl 目标代码，链接 OpenWrt 自己的
-#   musl），差别在：
-#     - codegen 随 rustc 版本变化 → 同一份源码在不同时间跑，产物不完全相同
-#     - 极少数 crate 在新版 rustc 上会报错（版本相关，不是静默错误）
-#   把两个版本号并排打在日志里，出问题时一眼能判断是不是版本引起的。
+#   runner 的 stable 省 30~60 分钟，但不一定等于 feed pin 的版本 —— codegen
+#   随版本变，产物不完全相同；极少数 crate 在新版上会报错（版本相关，不是
+#   静默错误）。两个版本号并排打出来，出问题时一眼能判断是不是版本引起的。
 # ---------------------------------------------------------------
 FEED_RUST_VER=$(sed -n 's/^PKG_VERSION:=//p' "$RUST_FEED/Makefile" 2>/dev/null | head -1 | tr -d ' \r')
 RUNNER_RUST_VER=$("$RUST_ROOT/bin/rustc" --version 2>/dev/null | awk '{print $2}')

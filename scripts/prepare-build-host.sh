@@ -1,21 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================
 # prepare-build-host.sh —— 用 runner 预装的工具替代从源码编译
-#
-#   参照 VIKINGYFY/OpenWRT-CI 的核心思路：
-#     不是「让缓存更快」，而是「让需要编译的东西更少」。
-#
-#   四招（按省时排序）：
-#     1. Go     —— external bootstrap，跳过五段自举    省 40~70 分钟
-#     2. BPF    —— 用 host LLVM，不编 LLVM
-#     3. Python —— 关掉 host 侧 PGO
-#     4. Rust   —— 由 prepare-rust.sh 单独处理          省 30~60 分钟
-#
-#   ★ 全部【软失败】：ponwrt 不一定支持每个配置项，
-#     检测不到就跳过并 warning，绝不让构建死在这里。
-#     每项都会在日志里明确报告「生效 / 跳过」。
-#
-#   用法: bash prepare-build-host.sh <openwrt_dir>
+#   思路不是「让缓存更快」，而是「让需要编译的东西更少」：
+#     1. Go     external bootstrap，跳过五段自举   省 40~70 分钟
+#     2. BPF    用 host LLVM，不编 LLVM
+#     3. Python 关掉 host 侧 PGO
+#     4. Rust   由 prepare-rust.sh 单独处理        省 30~60 分钟
+# ★ 全部软失败：ponwrt 不一定支持每个配置项，检测不到就 warning 跳过，
+#   绝不让构建死在这里。用法: bash prepare-build-host.sh <openwrt_dir>
 # =============================================================
 
 set -uo pipefail

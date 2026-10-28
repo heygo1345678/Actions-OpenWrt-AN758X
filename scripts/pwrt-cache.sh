@@ -1,46 +1,30 @@
 #!/usr/bin/env bash
 # =============================================================
-# pwrt-cache.sh —— 整体构建缓存助手
+# pwrt-cache.sh —— 整体构建缓存助手（移植自 VIKINGYFY/OpenWRT-CI）
 #
-#   移植自 VIKINGYFY/OpenWRT-CI 的 WRT-CORE.yml，四个要点：
-#
-#   1) 缓存对象是「目录本身」，不是我们自己打的 tar：
-#        staging_dir/host*    host + hostpkg（含 go / python 等 host 包）
-#        staging_dir/tool*    toolchain-<board>_<subtarget>
-#        .ccache              编译对象缓存（USE_CCACHE=true 时）
-#      actions/cache 原生按目录存取，不需要 zstd 打包，也不需要
-#      Release 当兜底仓库 —— 少一层中间物就少一类「打包成功但解开是空」的坑。
-#
+#   1) 缓存对象是目录本身，不自己打 tar：
+#        staging_dir/host*   host + hostpkg（go / python 在这）
+#        staging_dir/tool*   交叉编译器
+#        .ccache             编译对象缓存
 #   2) key = 前缀 + 上游提交号，restore-keys = 前缀-
-#        前缀只由「源站 + 分支 + SoC」决定，提交号一变只是换一代；
-#        恢复时靠前缀回退，永远能拿到该前缀下最近的一代。
-#        → 这就是「缓存永远命中」的来源。
-#      反观之前那套「tools/toolchain 的 md5 指纹 + 精确匹配、不做回退」：
-#      指纹只要有一项算不齐（口径两端不一致 / 上游改了一行 Makefile）
-#      就必然全量重编，而且永远修不好。
-#
-#   3) 恢复后必须 touch「非 target」的 stamp，并写 tmp/.build：
-#        .built 之类 —— 单个包「已编译」
-#        tmp/.build —— 整个构建环境「已初始化」
-#      tar/zip 还原的是旧 mtime，而源码树是刚 clone 的（mtime 是现在）。
-#      不刷新的话 make 认为「源码比产物新」→ 全部重编 → 缓存白命中。
-#
-#   4) 编译成功、且本次不是精确命中时才存新一代；旧的交给 rollover 删掉，
-#      保证 actions/cache 那 10GB 配额里每个前缀只有一份。
+#      前缀只由「源站 + 分支 + SoC + HOST_MODE」决定，提交号变了只是换一代，
+#      恢复靠前缀回退拿到最近一代 —— 这是「缓存永远命中」的来源。
+#   3) 恢复后必须刷新非 target 的 stamp 并写 tmp/.build：tar 还原的是旧
+#      mtime，不刷新 make 会认为源码更新 → 全量重编 → 缓存白命中。
+#   4) 编译成功且非精确命中才存新一代，旧代交给 rollover 删掉，
+#      保证 10GB 配额里每个前缀只有一份。
 #
 #   子命令：
-#     key       <openwrt_dir>   算 PREFIX / KEY（写 GITHUB_OUTPUT / GITHUB_ENV）
-#     prefix                    只算前缀（不需要 git 仓库）
-#     prepare   <openwrt_dir>   恢复后刷新 stamp、写 tmp/.build
-#     rollover                  删掉同前缀的旧代（读环境里的 PREFIX / KEY）
-#     pack      <ow> <outfile>  打包三个缓存目录（Release 备份通道）
-#     unpack    <ow> <infile>   解开 Release 备份
-#     status    <openwrt_dir>   打印体积与版本，写 $REPORT_DIR/pwrt-cache.txt
+#     key <dir>            算 PREFIX / KEY（写 GITHUB_OUTPUT / GITHUB_ENV）
+#     prefix               只算前缀（不需要 git 仓库）
+#     prepare <dir>        恢复后刷新 stamp、写 tmp/.build
+#     rollover             删掉同前缀的旧代（读环境里的 PREFIX / KEY）
+#     pack <ow> <outfile>  打包三个缓存目录（Release 备份通道）
+#     unpack <ow> <infile> 解开 Release 备份
+#     status <dir>         打印体积与版本，写 $REPORT_DIR/pwrt-cache.txt
 #
-#   环境变量（由 workflow 提供）：
-#     SOURCE / REPO_BRANCH / SOC   参与 key 前缀
-#     GITHUB_OUTPUT / GITHUB_ENV   有就写，没有就只打 stdout（本地调试）
-#     REPORT_DIR                    status 报告目录，默认 /tmp
+#   环境变量：SOURCE / REPO_BRANCH / SOC / HOST_MODE 参与前缀；
+#             GITHUB_OUTPUT / GITHUB_ENV 有就写；REPORT_DIR 默认 /tmp
 # =============================================================
 
 set -u
@@ -97,17 +81,10 @@ cmd_prefix() {
 
 # ---------------------------------------------------------------
 # key —— 前缀 + 上游提交号
-#
-#   ⚠ 刻意【不】把 .config、configs/*.config、diy-part*.sh 算进 key。
-#     那些东西只影响「target 侧编哪些包」，不影响 host 工具链 /
-#     交叉编译器 / hostpkg 的内容；算进去就会退化成之前那个
-#     「指纹一变就全量重编」的老问题。
-#     target 侧每次都要重编（runner 是干净的，build_dir 不存在），
-#     真要复用就用 ccache，别指望 staging 缓存。
-#
-#   ⚠ 也【不】把机型（profile）算进前缀：前缀是 subtarget 级的，
-#     同一 SoC 下 11 个机型共用一份 host/toolchain 缓存。这正是
-#     OpenWRT-CI 用 target-subtarget 而不是设备名做 key 的原因。
+# ⚠ 刻意不把 .config / configs/*.config / diy-part*.sh 算进 key：那些只影响
+#   target 侧编哪些包，不影响 host 工具链与 hostpkg；算进去就退化成「指纹一变
+#   就全量重编」。target 侧每次都要重编，要复用请用 ccache。
+# ⚠ 也不把机型算进前缀：前缀是 subtarget 级的，同 SoC 下所有机型共用一份。
 # ---------------------------------------------------------------
 cmd_key() {
   cd "$OW" || { echo "::error::无法进入 $OW"; exit 1; }
@@ -196,10 +173,17 @@ cmd_rollover() {
   command -v gh >/dev/null 2>&1 || { echo "::warning::无 gh，跳过轮换"; exit 0; }
 
   # 没给 KEY 时（warm-cache 的轮换 job 就是这种情况）：留最新创建的那一代
+  #
+  #   ⚠ 「最新」优先取不带 -early 的：-early 是工具链刚编完时存的早期版，
+  #     只有 tools/toolchain，没有编译阶段才带出来的 hostpkg。而同提交号
+  #     重跑时它往往比正式 key 还新，纯按 createdAt 会挑错。
+  #     组里一条正式 key 都没有时，才退回取最新的（那就是唯一的保底）。
   if [ -z "$key" ]; then
     key=$(gh cache list -R "$repo" --key "${prefix}-" --limit 100 \
             --json key,createdAt \
-            --jq 'sort_by(.createdAt) | reverse | .[0].key' 2>/dev/null || true)
+            --jq 'sort_by(.createdAt) | reverse
+                  | ((map(select(.key | endswith("-early") | not)) | .[0])
+                     // .[0]) | .key' 2>/dev/null || true)
     if [ -z "$key" ] || [ "$key" = "null" ]; then
       echo "${prefix}- 下没有任何缓存，无需轮换"
       exit 0
@@ -233,15 +217,10 @@ cmd_rollover() {
 }
 
 # ---------------------------------------------------------------
-# pack / unpack —— Release 备份通道用
-#
-#   actions/cache 的条目 7 天没人访问就回收，Release 资产不会 ——
-#   所以除了快通道，还往 Release 存一份同样的内容当长期兜底。
-#
-#   ★ 刻意只打「缓存路径那三个目录」，与 actions/cache 的 path 逐字一致：
-#     两边内容一致，才能「哪边先命中都算数」。
-#   ★ 用相对路径打包（cwd = openwrt 目录），解包时 -C 回同一目录即可，
-#     不会把 /workdir 这种机器相关前缀腌进 tar 里。
+# pack / unpack —— Release 备份通道
+#   actions/cache 7 天不访问就回收，Release 资产不会，所以另存一份兜底。
+# ★ 只打「缓存路径那三个目录」，与 actions/cache 的 path 逐字一致，才能
+#   「哪边先命中都算数」；用相对路径打包，不会把 /workdir 腌进 tar 里。
 # ---------------------------------------------------------------
 cache_paths() {   # 打印要打包的顶层条目（不存在的跳过）
   [ -e .ccache ] && echo ".ccache"

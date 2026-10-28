@@ -2,29 +2,16 @@
 # =============================================================
 # patch-cargo-offline.sh —— 放宽 rust 包的「禁止联网」限制
 #
-#   背景（真实踩到的坑）：
-#     package/custom/h3c-fttr-tools 的 Makefile 里是
-#       cargo install ... --locked --frozen
-#     --frozen = 「锁定 Cargo.lock + 禁止访问网络」，于是 cargo 只
-#     认本地缓存 CARGO_HOME=dl/cargo 里已经有的 crate。
+#   背景：h3c-fttr-tools 的 Makefile 用 cargo install --locked --frozen。
+#   --frozen = 锁版本 + 禁止联网，只认 CARGO_HOME(dl/cargo) 里已有的 crate；
+#   而 dl/cargo 从缓存继承（只增不减），上游在 Cargo.lock 加新依赖时缓存里没有：
+#     Caused by: failed to download `core_detect v1.0.0`
+#     Caused by: attempting to make an HTTP request, but --frozen was specified
+#   现象是编到一半某个 rust 包必挂，换机型、换缓存都复现。
 #
-#     而 dl/cargo 是从构建缓存里继承下来的（只增不减），包上游哪天
-#     在 Cargo.lock 里加了个新依赖（这次是 core_detect v1.0.0），
-#     缓存里就没有它：
-#       Caused by: failed to download `core_detect v1.0.0`
-#       Caused by: attempting to make an HTTP request, but --frozen was specified
-#
-#     现象是「编译到一半、某个 rust 包必挂」，而且换机型/换缓存都复现，
-#     因为 --frozen 根本不给自己补救的机会。
-#
-#   这里做的事：把这些 Makefile 里的 --frozen / --offline 摘掉。
-#     - --locked 保留 → 版本仍然锁死在 Cargo.lock，结果可复现
-#     - 去掉的只是「不许联网」这一条 → 缺什么当场补下，不再卡死
-#
-#   ⚠ 这是 CI 侧的兜底，不是最优解。更正统的做法在你的私有包里：
-#     在 Build/Prepare 里显式 `cargo fetch --locked`（联网阶段把 crate
-#     拉进 CARGO_HOME），编译阶段再用 --frozen。两者可以共存。
-#
+#   这里只摘掉 --frozen / --offline，--locked 保留（版本仍锁死，结果可复现）。
+# ⚠ 这是 CI 侧兜底。更正统的做法在包侧：Build/Prepare 里 cargo fetch --locked
+#   把 crate 拉进 CARGO_HOME，编译阶段再用 --frozen。
 #   用法: bash patch-cargo-offline.sh <openwrt_dir>
 # =============================================================
 
