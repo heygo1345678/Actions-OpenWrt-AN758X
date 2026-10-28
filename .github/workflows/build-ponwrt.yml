@@ -407,6 +407,12 @@ jobs:
           chmod +x "$S"
           bash "$S" key "$CACHE_ROOT"
 
+          # dl 缓存的 key 里不能出现 `/`：SOURCE 形如 pbs05/ponwrt，直接拼进去会
+          # 得到 ponwrt-dl-pbs05/ponwrt-master-202643，和工具链 key
+          # （ponwrt-pbs05-ponwrt-...，经 pwrt-cache.sh 的 slug() 处理）风格不一致，
+          # 将来按前缀批量清理时容易漏。这里用同一条规则预先 slug 一次。
+          echo "SOURCE_SLUG=$(printf '%s' "${SOURCE:-unknown}" | tr -c 'A-Za-z0-9._-' '-')" >> "$GITHUB_ENV"
+
       # =========================================================
       # 2.2 构建缓存：恢复
       #   key 精确到提交号，restore-keys 用前缀 + "-" 回退 —— 有它才有
@@ -744,8 +750,14 @@ jobs:
           # 按分支 + 周号：同一周内复用同一条目。
           # 原先用 github.run_number → 每次运行都 save 一份新副本，
           # 10GB 配额会被迅速刷满并淘汰掉有用的旧缓存。
-          key: ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-${{ steps.resolve.outputs.week }}
+          # ⚠ 用 SOURCE_SLUG（`pbs05/ponwrt` → `pbs05-ponwrt`），别用 SOURCE：
+          #   key 里带 `/` 本身能存，但与工具链 key 的写法不一致，后续按前缀
+          #   批量操作会漏掉这一条。
+          key: ponwrt-dl-${{ env.SOURCE_SLUG }}-${{ github.event.inputs.branch || 'master' }}-${{ steps.resolve.outputs.week }}
+          # 第二条是旧格式（SOURCE 原值，带斜杠）：只为平滑迁移，本轮拿到本周
+          # 那份 1.2 GB 后会按新格式存一份，旧的 7 天无访问自动回收。下版可删。
           restore-keys: |
+            ponwrt-dl-${{ env.SOURCE_SLUG }}-${{ github.event.inputs.branch || 'master' }}-
             ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-
 
       # =========================================================
@@ -1308,7 +1320,7 @@ jobs:
         uses: actions/cache/save@v5
         continue-on-error: true
         with:
-          key: ponwrt-dl-${{ env.SOURCE }}-${{ github.event.inputs.branch || 'master' }}-${{ steps.resolve.outputs.week }}
+          key: ponwrt-dl-${{ env.SOURCE_SLUG }}-${{ github.event.inputs.branch || 'master' }}-${{ steps.resolve.outputs.week }}
           path: /workdir/openwrt/dl
 
       # =========================================================
