@@ -80,18 +80,22 @@
 
 ## 构建缓存（移植自 VIKINGYFY/OpenWRT-CI）
 
-一份缓存 = 四个目录：
+一份缓存 = 三个目录：
 
 ```
 staging_dir/host*      host 工具 + hostpkg（go / python 在这）
 staging_dir/tool*      交叉编译器
-build_dir/host         仅快通道有：带 tools/* 的 .built 戳，省掉每轮 12~13 分钟
 .ccache                编译对象缓存
 ```
 
-`build_dir/host` 只进 `actions/cache`，不进 Release 备份（备份是过期兜底，多传
-300 MB 换一次 13 分钟不划算）。`build_dir/toolchain-*`（3~4 GB）和 `build_dir/hostpkg`
-也都没进缓存 —— 前者靠 ccache 压到 13 分钟，后者缺失只影响 go 的一次补编。
+**tools / toolchain 会不会重编，取决于 `staging_dir` 里的 compile 戳，不取决于缓存里
+有没有 `build_dir`。** `make world` 的 `prepare` 依赖
+`staging_dir/host/stamp/.tools_compile_<flags>` 和 `staging_dir/toolchain-*/stamp/.toolchain_compile`，
+这两个戳存在且比源码树新，`tools/compile` 与 `toolchain/compile` 就整段跳过。
+
+所以 `prepare` 只在 **actions/cache 精确命中**（同一提交）时才保留这两个戳；前缀回退
+和 Release 恢复都可能是别的提交、源码已变，脚本会删掉它们迫使 make 重编（约 26 分钟，
+ccache 会加速）。当前提交通常在第一次构建时付这 26 分钟，之后同提交重跑都是 0 分钟。
 
 | 通道 | 介质 | 特点 |
 |---|---|---|
