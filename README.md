@@ -49,15 +49,34 @@
 
 ## 插件开关（`diy-part1.sh`）
 
-**默认开启**：`ADD_AIROHA_NPU`（`luci-app-airoha-npu`，NPU 卸载 / CPU 频率 / Frame Engine / PPE 流表）、`ADD_LUCI_APP`（`luci-app-natmode` NAT 类型三选一 + `luci-app-pon-status` 光模块表格）。
+全部默认开启，开关与 `configs/an7581.config` / `an7583.config` 里的 `=y` 一一对应：
+
+| 开关 | 包 | 备注 |
+|---|---|---|
+| `ADD_AIROHA_NPU` | `luci-app-airoha-npu` | NPU 卸载 / CPU 频率 / Frame Engine / PPE 流表 |
+| `ADD_LUCI_APP` | `luci-app-natmode`、`luci-app-pon-status` | NAT 类型三选一、PON 光模块卡片 |
+| `ADD_FLUENT` | `luci-theme-fluent` | 与 `argon` / `bootstrap` 可共存 |
+| `ADD_PASSWALL` | `luci-app-passwall` + `xray-core` / `sing-box` | 新版 passwall 把内核做成按需安装，config 里另开了两个 feeds 现成的 |
+| `ADD_OPENCLASH` | `luci-app-openclash` | ⚠ 拖 Ruby 进构建，首次 +20~40 分钟 |
+| `ADD_MOSDNS` | `luci-app-mosdns` | 本体用 feeds 的 `mosdns` |
+| `ADD_SMARTDNS` | `luci-app-smartdns` | 本体用 feeds 的 `smartdns` |
+| `ADD_TAILSCALE` | `luci-app-tailscale` | 本体用 feeds 的 `tailscale` |
+| `ADD_LUCKY` | `luci-app-lucky` | 含 `lucky` 本体 |
+| `ADD_OPENLIST` | `luci-app-openlist2` | 含 `openlist2` 本体 |
+| `ADD_EASYTIER` | `luci-app-easytier` + `easytier` | 本体是 Rust 包，编译较慢 |
+| `ADD_POWEROFF` / `ADD_OWQ_WOL` / `ADD_WATCHDOG` / `ADD_TASKPLAN` | 同名 `luci-app-*` | |
+| `ADD_OAF` | `luci-app-oaf` + `appfilter` / `kmod-oaf` | 含内核模块 |
+
+**要关掉某个插件，改两处**：脚本里 `ADD_xxx=false`，**并且**把两个通用 config 里对应的
+`CONFIG_PACKAGE_xxx=y` 删掉（或改成 `# ...is not set`）。只改一处会不一致：
+只关脚本 → `make defconfig` 把 `=y` 静默剔除；只关 config → 白 clone 一个仓库。
+
+**四个「只用 feeds」的包**（`MOSDNS` / `SMARTDNS` / `PASSWALL` / `TAILSCALE`）：它们的本体
+（`mosdns` / `smartdns` / `xray-core` / `sing-box` / `tailscale`）feeds 里已有同名包，
+第三方源再拉一份会让索引里出现两个同名 `Package`，`package-metadata` 按扫描顺序挑一个、
+行为不可预期。所以脚本只拷 luci 前端，本体一律用 feeds 的。
 
 `ADD_FTTR` 及其子开关只在 `h3c_hm2004-du` 下生效，其余机型自动跳过。
-
-**默认关闭**：passwall / openclash / mosdns / lucky / tailscale / openlist / smartdns / easytier / wol / watchdog / taskplan / oaf / fluent 主题。
-要用哪个，改两处：脚本里对应 `ADD_xxx=true`，**并且**在 `configs/<机型>.config` 里把 `CONFIG_PACKAGE_xxx` 改成 `=y`。只改一处等于「拉下来了但没编进去」。
-
-> `ADD_SMARTDNS` / `ADD_PASSWALL` 拉的是与 feeds 同名的包（`pymumu/smartdns`、passwall 系列），
-> 同时打开会出现两份同名包，最终用哪份取决于扫描顺序——已经在 config 里打开这些包时优先用 feeds 的。
 
 ## 构建缓存（移植自 VIKINGYFY/OpenWRT-CI）
 

@@ -18,23 +18,30 @@ mkdir -p "$PKG_DIR"
 # 温度不再用 luci-app-temp-status —— 由 autocore 的 /sbin/tempinfo 提供，
 # 见 files/sbin/tempinfo（概览页「温度」行：CPU / WiFi / PON 温度 + 光功率）
 # ---------------------------------------------------------
+# ⚠ 下面这些包都在 configs/an7581.config 与 an7583.config 里 =y 了，
+#   关掉开关会让 defconfig 把 =y 静默剔除 —— 两处必须一起改。
+#
+# ⚠ 标了「只用 feeds」的四个，是它们的本体（mosdns / smartdns / xray-core /
+#   sing-box）feeds 里已经有同名包，第三方源再拉一份会让索引里出现两个同名
+#   Package，package-metadata 按扫描顺序挑一个，行为不可预期。所以只拷 luci
+#   前端，本体一律用 feeds 的。
 ADD_AIROHA_NPU=true    # luci-app-airoha-npu：Airoha SoC 状态页（NPU/CPU/Frame Engine/PPE）
-ADD_FLUENT=false        # luci-theme-fluent：Fluent 2 风格主题
+ADD_FLUENT=true        # luci-theme-fluent：Fluent 2 风格主题
 ADD_FLUENT_LITE=false  # luci-theme-fluent-lite：轻量版（与 fluent 互斥，二选一）
 ADD_FLUENT_DASH=false  # luci-mod-fluentdashboard：可选状态概览卡片
-ADD_PASSWALL=false      # luci-app-passwall（含依赖源）
-ADD_OPENCLASH=false     # luci-app-openclash ⚠ 依赖 Ruby/Rust，编译极慢
-ADD_MOSDNS=false        # luci-app-mosdns + v2ray-geodata
-ADD_LUCKY=false         # luci-app-lucky（DDNS + socat）
-ADD_TAILSCALE=false     # luci-app-tailscale
-ADD_OPENLIST=false      # luci-app-openlist2（alist/openlist 挂载）
-ADD_SMARTDNS=false      # luci-app-smartdns
-ADD_EASYTIER=false      # luci-app-easytier（另需 kmod-tun + easytier 本体，Rust 编译较慢）
-ADD_POWEROFF=false      # luci-app-poweroffdevice（关机）
-ADD_OWQ_WOL=false       # luci-app-owq-wol（网络唤醒，依赖 etherwake）
-ADD_WATCHDOG=false      # luci-app-watchdog（看门狗，包在子目录，需特殊处理）
-ADD_TASKPLAN=false      # luci-app-taskplan（定时任务）
-ADD_OAF=false           # luci-app-oaf（应用过滤，含内核模块，高风险）
+ADD_PASSWALL=true      # luci-app-passwall（只用 feeds 的依赖包）
+ADD_OPENCLASH=true     # luci-app-openclash ⚠ 依赖 Ruby/Rust，编译极慢
+ADD_MOSDNS=true        # luci-app-mosdns（本体只用 feeds 的 mosdns）
+ADD_LUCKY=true         # luci-app-lucky（DDNS + socat）
+ADD_TAILSCALE=true     # luci-app-tailscale（本体只用 feeds 的 tailscale）
+ADD_OPENLIST=true      # luci-app-openlist2（alist/openlist 挂载）
+ADD_SMARTDNS=true      # luci-app-smartdns（本体只用 feeds 的 smartdns）
+ADD_EASYTIER=true      # luci-app-easytier（另需 kmod-tun + easytier 本体，Rust 编译较慢）
+ADD_POWEROFF=true      # luci-app-poweroffdevice（关机）
+ADD_OWQ_WOL=true       # luci-app-owq-wol（网络唤醒，依赖 etherwake）
+ADD_WATCHDOG=true      # luci-app-watchdog（看门狗，包在子目录，需特殊处理）
+ADD_TASKPLAN=true      # luci-app-taskplan（定时任务）
+ADD_OAF=true           # luci-app-oaf（应用过滤，含内核模块，高风险）
 ADD_LUCI_APP=true       # qwe-qaq/luci-app 仓库（monorepo）
                         #   ├─ luci-app-natmode     NAT 类型三选一（网络 → NAT 类型）
                         #   └─ luci-app-pon-status  PON 光模块卡片（概览页「系统」下一格）
@@ -220,10 +227,21 @@ if [ "$ADD_AIROHA_NPU" = "true" ]; then
 fi
 
 # --- passwall ---
+# 源已从 xiaorouji 迁到 Openwrt-Passwall 组织（旧地址 404）。
+# ⚠ 只拷 luci-app-passwall 子目录：openwrt-passwall-packages 是 monorepo，
+#   里面 xray-core / sing-box / hysteria / naiveproxy / shadowsocks-rust …
+#   全部与 feeds 同名，整仓拷进来就是两份同名包。依赖一律用 feeds 的。
 if [ "$ADD_PASSWALL" = "true" ]; then
-  clone https://github.com/xiaorouji/openwrt-passwall-packages "$PKG_DIR/openwrt-passwall-packages" main
-  clone https://github.com/xiaorouji/openwrt-passwall "$PKG_DIR/openwrt-passwall" main
-  rm -rf "$PKG_DIR/openwrt-passwall/luci-app-passwall2" 2>/dev/null
+  PW_TMP="$(mktemp -d)/pw"
+  if clone https://github.com/Openwrt-Passwall/openwrt-passwall "$PW_TMP" main \
+     && [ -f "$PW_TMP/luci-app-passwall/Makefile" ]; then
+    rm -rf "$PKG_DIR/luci-app-passwall"
+    cp -r "$PW_TMP/luci-app-passwall" "$PKG_DIR/"
+    echo "✅ 已拷贝: luci-app-passwall"
+  else
+    echo "::error::luci-app-passwall 拉取失败或结构变化"
+  fi
+  rm -rf "$PW_TMP"
 fi
 # --- openclash ---
 if [ "$ADD_OPENCLASH" = "true" ]; then
@@ -233,9 +251,19 @@ if [ "$ADD_OPENCLASH" = "true" ]; then
   rm -rf "$PKG_DIR/OpenClash"
 fi
 # --- mosdns ---
+# ⚠ 只拷 luci-app-mosdns 子目录：仓库里还带 mosdns 本体与 v2ray-geodata，
+#   两个都与 feeds 同名。本体用 feeds 的。
 if [ "$ADD_MOSDNS" = "true" ]; then
-  clone https://github.com/sbwml/luci-app-mosdns "$PKG_DIR/luci-app-mosdns" v5
-  clone https://github.com/sbwml/v2ray-geodata "$PKG_DIR/v2ray-geodata" master
+  MD_TMP="$(mktemp -d)/mosdns"
+  if clone https://github.com/sbwml/luci-app-mosdns "$MD_TMP" v5 \
+     && [ -f "$MD_TMP/luci-app-mosdns/Makefile" ]; then
+    rm -rf "$PKG_DIR/luci-app-mosdns"
+    cp -r "$MD_TMP/luci-app-mosdns" "$PKG_DIR/"
+    echo "✅ 已拷贝: luci-app-mosdns（本体用 feeds）"
+  else
+    echo "::error::luci-app-mosdns 拉取失败或结构变化"
+  fi
+  rm -rf "$MD_TMP"
 fi
 # --- lucky ---
 if [ "$ADD_LUCKY" = "true" ]; then
@@ -250,9 +278,10 @@ if [ "$ADD_OPENLIST" = "true" ]; then
   clone https://github.com/sbwml/luci-app-openlist2 "$PKG_DIR/luci-app-openlist2" main
 fi
 
+# --- smartdns ---
+# ⚠ 不拉 pymumu/smartdns 本体：与 feeds/packages/net/smartdns 同名。
 if [ "$ADD_SMARTDNS" = "true" ]; then
   clone https://github.com/pymumu/luci-app-smartdns "$PKG_DIR/luci-app-smartdns" master
-  clone https://github.com/pymumu/smartdns "$PKG_DIR/smartdns" master
 fi
 # --- luci-theme-fluent ---
 # ⚠ 包在仓库的 package/ 子目录下，不能直接 clone 到 package/custom，
@@ -279,7 +308,7 @@ if [ "$ADD_EASYTIER" = "true" ]; then
   clone https://github.com/EasyTier/luci-app-easytier "$PKG_DIR/luci-app-easytier" main
 fi
 if [ "$ADD_POWEROFF" = "true" ]; then
-  clone https://github.com/sirpdboy/luci-app-poweroffdevice "$PKG_DIR/luci-app-poweroffdevice" main
+  clone https://github.com/sirpdboy/luci-app-poweroffdevice "$PKG_DIR/luci-app-poweroffdevice" master
 fi
 if [ "$ADD_OWQ_WOL" = "true" ]; then
   clone https://github.com/isalikai/luci-app-owq-wol "$PKG_DIR/luci-app-owq-wol" main
@@ -423,6 +452,25 @@ if [ -n "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
   if [ "$ADD_LUCI_APP" = "true" ]; then
     REQUIRED="$REQUIRED luci-app-natmode luci-app-pon-status"
   fi
+
+  # 与 configs/an7581.config / an7583.config 里 =y 的包一一对应。
+  # 任一项没进索引，defconfig 都会把那个 =y 静默剔除 —— 编出来的固件少了菜单
+  # 还不易察觉。所以这里和 config 必须同步改。
+  [ "$ADD_FLUENT"    = "true" ] && REQUIRED="$REQUIRED luci-theme-fluent"
+  [ "$ADD_OPENCLASH" = "true" ] && REQUIRED="$REQUIRED luci-app-openclash"
+  [ "$ADD_PASSWALL"  = "true" ] && REQUIRED="$REQUIRED luci-app-passwall"
+  [ "$ADD_MOSDNS"    = "true" ] && REQUIRED="$REQUIRED luci-app-mosdns"
+  [ "$ADD_LUCKY"     = "true" ] && REQUIRED="$REQUIRED luci-app-lucky"
+  [ "$ADD_TAILSCALE" = "true" ] && REQUIRED="$REQUIRED luci-app-tailscale"
+  [ "$ADD_OPENLIST"  = "true" ] && REQUIRED="$REQUIRED luci-app-openlist2"
+  [ "$ADD_SMARTDNS"  = "true" ] && REQUIRED="$REQUIRED luci-app-smartdns"
+  [ "$ADD_EASYTIER"  = "true" ] && REQUIRED="$REQUIRED luci-app-easytier"
+  [ "$ADD_POWEROFF"  = "true" ] && REQUIRED="$REQUIRED luci-app-poweroffdevice"
+  [ "$ADD_OWQ_WOL"   = "true" ] && REQUIRED="$REQUIRED luci-app-owq-wol"
+  [ "$ADD_WATCHDOG"  = "true" ] && REQUIRED="$REQUIRED luci-app-watchdog"
+  [ "$ADD_TASKPLAN"  = "true" ] && REQUIRED="$REQUIRED luci-app-taskplan"
+  [ "$ADD_OAF"       = "true" ] && REQUIRED="$REQUIRED luci-app-oaf"
+  true
   if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
     # KernelPackage 生成的包名带 kmod- 前缀，索引里写的是 kmod-h3c-fmcs
     if [ "$ADD_FMCS" = "true" ]; then
