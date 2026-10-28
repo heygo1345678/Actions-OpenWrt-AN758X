@@ -326,8 +326,25 @@ jobs:
       - name: Re-run defconfig
         run: |
           cd "$CACHE_ROOT"
-          make defconfig 2>&1 | tail -5
-          grep -E 'GOLANG_EXTERNAL_BOOTSTRAP_ROOT|BPF_TOOLCHAIN_HOST' .config || true
+          # 同 build-ponwrt.yml：不要用 `make defconfig 2>&1 | tail -5`
+          # （管道会把失败吞成 0）。脚本内部失败即 exit 1。
+          S="$GITHUB_WORKSPACE/scripts/defconfig.sh"
+          [ -f "$S" ] || { echo "::error::缺 $S"; exit 1; }
+          dos2unix "$S" 2>/dev/null || true
+          bash "$S" "$CACHE_ROOT"
+
+          # prepare-build-host.sh 的注入项在 defconfig 后是否还活着：
+          # 被冲掉就等于那几招全白做，只剩「跑过了但没生效」。
+          # source 模式本来就不该有这两个符号，所以只在 prebuilt 下检查。
+          if [ "${PREBUILT_HOST:-true}" = "true" ]; then
+            for k in GOLANG_EXTERNAL_BOOTSTRAP_ROOT BPF_TOOLCHAIN_HOST; do
+              if grep -q "^CONFIG_${k}=" .config; then
+                echo "✅ $k 保留: $(grep -m1 "^CONFIG_${k}=" .config)"
+              else
+                echo "::warning::$k 在 defconfig 后消失 —— host 加速未生效，会退回源码编译"
+              fi
+            done
+          fi
 
       # =========================================================
       # 只有真没命中才编；命中（含前缀回退命中）就整段跳过

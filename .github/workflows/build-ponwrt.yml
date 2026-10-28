@@ -959,9 +959,19 @@ jobs:
         run: |
           cd "$BUILD_ROOT/openwrt"
 
-          # diffconfig(精简配置) 必须 defconfig 展开；保留末尾输出便于排查
-          echo "===== make defconfig ====="
-          make defconfig 2>&1 | tail -5
+          # diffconfig(精简配置) 必须 defconfig 展开。
+          #
+          # ⚠ 不要写成 `make defconfig 2>&1 | tail -5`：
+          #   管道退出码取的是 tail 的 0，defconfig 失败会被吞掉，
+          #   紧接着的关键包校验就会拿「半展开的 .config」报
+          #   「检查 feeds 是否完整」—— 指向完全错误的方向。
+          #   scripts/defconfig.sh 负责：失败 → 打真日志 + exit 1；
+          #   成功 → 只打尾部 5 行，另把 WARNING 汇总出来
+          #   （WARNING 正是「包被静默剔除」的第一现场）。
+          S="$GITHUB_WORKSPACE/scripts/defconfig.sh"
+          [ -f "$S" ] || { echo "::error::缺 $S"; exit 1; }
+          dos2unix "$S" 2>/dev/null || true
+          bash "$S" "$PWD"
 
           # =========================================================
           # 关键包校验：defconfig 会把 feeds 里不存在的包静默剔除，
@@ -1280,9 +1290,15 @@ jobs:
           cd "$BUILD_ROOT/openwrt"
 
           # 1) 确保 .config 里有 CONFIG_CCACHE=y（rules.mk 据此启用 ccache）
+          #
+          # ⚠ 这里【不】跑 make defconfig：
+          #   1) rules.mk 是直接解析 .config 里的 CONFIG_CCACHE，不需要 kconfig 展开；
+          #   2) 步骤 9 的注释写明「唯一一次 defconfig」，这里再跑一次会把
+          #      diy-part2.sh 之后写进 .config 的选择重新展开一遍，正是那条
+          #      注释要避免的事；
+          #   3) 原来那行还带 `|| true`，连失败都看不见（同 P0：管道/短路吞错）。
           sed -i '/^CONFIG_CCACHE=/d; /^# CONFIG_CCACHE is not set/d' .config
           echo 'CONFIG_CCACHE=y' >> .config
-          make defconfig >/dev/null 2>&1 || true
 
           # 2) 缺二进制就补装（ccache 依赖 xxhash → cmake，首次会多花几分钟）
           if [ ! -x staging_dir/host/bin/ccache ]; then
