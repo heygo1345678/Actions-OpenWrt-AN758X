@@ -113,7 +113,7 @@ ccache 会加速）。当前提交通常在第一次构建时付这 26 分钟，
 
 **恢复后必须做三件事**（`scripts/pwrt-cache.sh prepare`），少一件就等于白命中：touch 非 target 的 stamp、写 `tmp/.build`、touch 目录本身。
 
-**dl 缓存**（源码包，2~5 GB）单独一条，key 按周滚动 `ponwrt-dl-<源站>-<分支>-<YYYYWW>`。保存在 `make download` 之后、编译之前——350 分钟一到 job 直接 cancel，放最后用 `always()` 也来不及跑。
+**dl 缓存**（源码包，2~5 GB）单独一条，key 按周滚动 `ponwrt-dl-<源站 slug>-<分支>-<YYYYWW>`（`pbs05/ponwrt` → `pbs05-ponwrt`，与工具链 key 同一套规则）。保存在 `make download` 之后、编译之前——350 分钟一到 job 直接 cancel，放最后用 `always()` 也来不及跑。
 
 **两种 host 模式不共用缓存**：`HOST_MODE` 进前缀。prebuilt 在 `staging_dir` 里留的是指向 runner 的符号链接，source 留的是真二进制，混用会让 make 误判「已安装」并在编译期报一个完全对不上的错。**warm-cache 必须和主流程选同一个模式**，否则预热白跑。
 
