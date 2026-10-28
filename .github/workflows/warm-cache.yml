@@ -247,6 +247,7 @@ jobs:
           restore-keys: ${{ steps.cache-key.outputs.prefix }}-
           path: |
             ${{ env.CACHE_ROOT }}/.ccache
+            ${{ env.CACHE_ROOT }}/build_dir/host
             ${{ env.CACHE_ROOT }}/staging_dir/host*
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
@@ -459,6 +460,7 @@ jobs:
           key: ${{ steps.cache-key.outputs.key }}
           path: |
             ${{ env.CACHE_ROOT }}/.ccache
+            ${{ env.CACHE_ROOT }}/build_dir/host
             ${{ env.CACHE_ROOT }}/staging_dir/host*
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
