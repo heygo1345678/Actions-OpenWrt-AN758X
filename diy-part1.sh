@@ -114,8 +114,8 @@ fi
 #                      @(TARGET_airoha_an7581)，另依赖 +kmod-spi-gpio
 #   h3c-fttr-tools     Rust 包，硬 include feeds/packages/lang/rust/rust-package.mk
 #   h3c-fmcs-firmware  纯数据包，FPGA 比特流 → /lib/firmware/FTTR_TOP.sbit
-# ⚠ 下面索引校验里 h3c-fmcs 会显示 ❌ —— 循环按目录名查，而 KernelPackage 记的
-#   是 kmod-h3c-fmcs。INDEX_MISS 只产生 warning，硬校验另按 kmod- 名查。
+# ⚠ h3c-fmcs 是 KernelPackage，索引里的名字是 kmod-h3c-fmcs。下面的包索引
+#   校验内置了这层映射（pkgname_of），看到的是 ✅ h3c-fmcs → kmod-h3c-fmcs。
 # =========================================================
 if [ "$ADD_FTTR" = "true" ] && [ "$FTTR_PROFILE" = "h3c_hm2004-du" ]; then
   # 仓库与分支由 workflow 注入，本地手工跑时回退到下面的默认值
@@ -257,8 +257,17 @@ if [ "$ADD_MOSDNS" = "true" ]; then
   MD_TMP="$(mktemp -d)/mosdns"
   if clone https://github.com/sbwml/luci-app-mosdns "$MD_TMP" v5 \
      && [ -f "$MD_TMP/luci-app-mosdns/Makefile" ]; then
-    rm -rf "$PKG_DIR/luci-app-mosdns"
+    rm -rf "$PKG_DIR/luci-app-mosdns" "$PKG_DIR/geo2txt"
     cp -r "$MD_TMP/luci-app-mosdns" "$PKG_DIR/"
+    # geo2txt 是 luci-app-mosdns 的硬依赖（LUCI_DEPENDS 里 +geo2txt），
+    # feeds 里没有同名包，必须一起拷进来，否则索引时报
+    # "has a dependency on 'geo2txt', which does not exist"
+    if [ -f "$MD_TMP/geo2txt/Makefile" ]; then
+      cp -r "$MD_TMP/geo2txt" "$PKG_DIR/"
+      echo "✅ 已拷贝: geo2txt（luci-app-mosdns 依赖）"
+    else
+      echo "::warning::mosdns 仓库里没有 geo2txt，luci-app-mosdns 会缺这个依赖"
+    fi
     echo "✅ 已拷贝: luci-app-mosdns（本体用 feeds）"
   else
     echo "::error::luci-app-mosdns 拉取失败或结构变化"
@@ -316,11 +325,22 @@ fi
 if [ "$ADD_TASKPLAN" = "true" ]; then
   clone https://github.com/sirpdboy/luci-app-taskplan "$PKG_DIR/luci-app-taskplan" main
 fi
-if [ "$ADD_WATCHDOG" = "true" ]; then   # 包在子目录，必须拷出子目录，不能整仓丢进去
+# --- watchdog ---
+# ⚠ 仓库是 monorepo：根目录无 Makefile，luci-app-watchdog/（前端）与
+#   watchdog/（本体）是两个包，前者依赖 +watchdog，两个都要拷。
+#   只拷前端时索引会报 "has a dependency on 'watchdog', which does not exist"。
+if [ "$ADD_WATCHDOG" = "true" ]; then
   WD_TMP="$(mktemp -d)/wd"
-  clone https://github.com/sirpdboy/luci-app-watchdog "$WD_TMP" main
-  rm -rf "$PKG_DIR/luci-app-watchdog"
-  cp -r "$WD_TMP/luci-app-watchdog" "$PKG_DIR/luci-app-watchdog"
+  if clone https://github.com/sirpdboy/luci-app-watchdog "$WD_TMP" main; then
+    for p in luci-app-watchdog watchdog; do
+      [ -f "$WD_TMP/$p/Makefile" ] || { echo "::warning::$p 不存在（上游改结构了？）"; continue; }
+      rm -rf "$PKG_DIR/$p"
+      cp -r "$WD_TMP/$p" "$PKG_DIR/"
+      echo "✅ 已拷贝: $p"
+    done
+  else
+    echo "::error::luci-app-watchdog 拉取失败"
+  fi
   rm -rf "$WD_TMP"
 fi
 if [ "$ADD_OAF" = "true" ]; then
@@ -388,10 +408,16 @@ fi
 # 所有包符号都不存在。
 # ---------------------------------------------------------
 echo "--- 检查重复嵌套目录 ---"
+# ⚠ 判据必须包含「根目录也有 Makefile」，否则会误删 monorepo 的真包：
+#   lucky / openlist2 / easytier / taskplan / poweroffdevice 的仓库根目录【没有】
+#   Makefile，同名子目录才是唯一的那份包 —— 只看「有同名子目录」就会把它们
+#   当重复项删掉，包从索引里消失、config 的 =y 被 defconfig 静默剔除。
+#   只有 rchen14b/luci-app-airoha-npu 那种「根目录一份 + 同名子目录又一份」
+#   才是要清理的坏结构（内层 dump 失败会中断整个 custom feed 的索引）。
 for d in "$PKG_DIR"/*; do
   [ -d "$d" ] || continue
   n=$(basename "$d")
-  if [ -d "$d/$n" ] && [ -f "$d/$n/Makefile" ]; then
+  if [ -f "$d/Makefile" ] && [ -d "$d/$n" ] && [ -f "$d/$n/Makefile" ]; then
     rm -rf "$d/$n"
     echo "✅ 已移除重复嵌套目录: $n/$n"
   fi
@@ -423,19 +449,52 @@ if [ -n "$(ls -A "$PKG_DIR" 2>/dev/null)" ]; then
   echo "=========================================="
   echo "package/custom 内容："
   INDEX_MISS=""
+  # 目录名 ≠ 包名的情况（Makefile 里显式写了 PKG_NAME / KernelPackage）：
+  #   open-app-filter 的包是 appfilter、oaf 的 KernelPackage 是 kmod-oaf，
+  #   按目录名去索引里查必然查不到 —— 那是误报，不是索引失败。
+  pkgname_of() {
+    case "$1" in
+      open-app-filter) echo "appfilter" ;;
+      oaf)             echo "kmod-oaf" ;;
+      h3c-fmcs)        echo "kmod-h3c-fmcs" ;;
+      *)               echo "$1" ;;
+    esac
+  }
+
   for d in "$PKG_DIR"/*; do
     [ -d "$d" ] || continue
     n=$(basename "$d")
+
+    # 无根 Makefile = monorepo 容器（lucky / openlist2 / easytier / taskplan /
+    # poweroffdevice / watchdog），真正的包在同名子目录里，逐个查
     if [ ! -f "$d/Makefile" ]; then
-      echo "  -  $n（无根 Makefile，视为源仓库/子包容器，跳过）"
+      found=0
+      # 直接对 glob 迭代，不拼字符串再分词 —— 拼了就得依赖 IFS 分词，
+      # 换个 shell（zsh 默认不拆）行为就变
+      for sd in "$d"/*/Makefile; do
+        [ -f "$sd" ] || continue
+        found=1
+        sn="$(basename "$(dirname "$sd")")"
+        if grep -qx "Package: $sn" tmp/.packageinfo 2>/dev/null; then
+          echo "  ✅ $n → $sn"
+        else
+          echo "  ❌ $n → $sn —— tmp/.packageinfo 里查不到"
+          INDEX_MISS="$INDEX_MISS $sn"
+          for f in "logs/package/$sn/dump.txt" "logs/package/custom/$sn/dump.txt"; do
+            [ -f "$f" ] && { echo "===== $f ====="; tail -25 "$f"; }
+          done
+        fi
+      done
+      [ "$found" = 1 ] || echo "  -  $n（无 Makefile，跳过）"
       continue
     fi
-    # 目录名即包名：buildroot 约定 PKG_NAME ?= $(notdir ${CURDIR})
-    if grep -qx "Package: $n" tmp/.packageinfo 2>/dev/null; then
-      echo "  ✅ $n"
+
+    pn="$(pkgname_of "$n")"
+    if grep -qx "Package: $pn" tmp/.packageinfo 2>/dev/null; then
+      echo "  ✅ $n${pn:+$([ "$pn" != "$n" ] && echo " → $pn")}"
     else
-      echo "  ❌ $n —— tmp/.packageinfo 里查不到"
-      INDEX_MISS="$INDEX_MISS $n"
+      echo "  ❌ $n（包名 $pn）—— tmp/.packageinfo 里查不到"
+      INDEX_MISS="$INDEX_MISS $pn"
       # 真实错误在这里（scan.mk 落盘路径 logs/<SCAN_DIR>/<相对目录>/dump.txt）
       for f in "logs/package/$n/dump.txt" "logs/package/custom/$n/dump.txt"; do
         [ -f "$f" ] && { echo "===== $f ====="; tail -25 "$f"; }
