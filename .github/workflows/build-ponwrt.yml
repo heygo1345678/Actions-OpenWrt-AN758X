@@ -45,7 +45,7 @@ env:
 
   # =========================================================
   # 整体构建缓存 —— 移植自 VIKINGYFY/OpenWRT-CI 的滚动缓存
-  #   一份 = staging_dir/host* + staging_dir/tool* + build_dir/host + .ccache
+  #   一份 = staging_dir/host* + staging_dir/tool* + .ccache
   #   key = ponwrt-<源站>-<分支>-<SoC>-<HOST_MODE>-<提交号>，回退键为同前缀 + "-"
   # ★ 前缀永远稳定、只有提交号会变，所以「命中」不取决于两端指纹能否对上。
   #   两条通道：① actions/cache（快，7 天无访问回收）② Release（慢，永久）；
@@ -413,11 +413,6 @@ jobs:
       #   「提交号变了仍命中上一代」，缓存随每次构建自动向前滚动。
       # ⚠ host* 同时覆盖 host 与 hostpkg（go / python 在这），tool* 覆盖
       #   toolchain-*。不缓存 target-*：那是固件包安装产物，每次都要重来。
-      # ★ 还缓存 build_dir/host：只有它带着 tools/* 的 .built 戳，没有它
-      #   make 会认为每个 host 工具都没编过，world 里固定重花 12~13 分钟
-      #   重跑 tools/compile（实测 #192：54 个工具 12 分 51 秒）。
-      #   ⚠ 只加 build_dir/host，不加 build_dir/toolchain-*（3~4 GB，ccache
-      #   已经把那段压到 13 分钟了）也不加 hostpkg（go 的构建树 ~1 GB）。
       # =========================================================
       - name: Restore build cache
         id: cache-restore
@@ -428,7 +423,6 @@ jobs:
           restore-keys: ${{ steps.cache-key.outputs.prefix }}-
           path: |
             ${{ env.CACHE_ROOT }}/.ccache
-            ${{ env.CACHE_ROOT }}/build_dir/host
             ${{ env.CACHE_ROOT }}/staging_dir/host*
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
@@ -504,6 +498,10 @@ jobs:
               || steps.release-restore.outputs.restored == 'true')
         env:
           RESTORED_FROM: ${{ steps.cache-restore.outputs.cache-matched-key || format('Release:{0}', steps.release-restore.outputs.restored) }}
+          # 只有「actions/cache 精确命中」才等于「这份缓存就是当前提交编出来的」，
+          # 此时 tools/toolchain 一定完整，可以跳过重编；前缀回退或 Release 恢复
+          # 都可能是别的提交，源码比缓存新，必须让 make 重编。
+          CACHE_EXACT: ${{ steps.cache-restore.outputs.cache-hit == 'true' && 'true' || 'false' }}
         run: |
           cd "$CACHE_ROOT"
           echo "来源: $RESTORED_FROM"
@@ -1166,7 +1164,6 @@ jobs:
           key: ${{ steps.cache-key.outputs.key }}-early
           path: |
             ${{ env.CACHE_ROOT }}/.ccache
-            ${{ env.CACHE_ROOT }}/build_dir/host
             ${{ env.CACHE_ROOT }}/staging_dir/host*
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
@@ -1367,7 +1364,6 @@ jobs:
           key: ${{ steps.cache-key.outputs.key }}
           path: |
             ${{ env.CACHE_ROOT }}/.ccache
-            ${{ env.CACHE_ROOT }}/build_dir/host
             ${{ env.CACHE_ROOT }}/staging_dir/host*
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 

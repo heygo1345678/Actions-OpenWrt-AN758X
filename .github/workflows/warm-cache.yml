@@ -247,7 +247,6 @@ jobs:
           restore-keys: ${{ steps.cache-key.outputs.prefix }}-
           path: |
             ${{ env.CACHE_ROOT }}/.ccache
-            ${{ env.CACHE_ROOT }}/build_dir/host
             ${{ env.CACHE_ROOT }}/staging_dir/host*
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
@@ -300,6 +299,7 @@ jobs:
               || steps.release-restore.outputs.restored == 'true')
         env:
           RESTORED_FROM: ${{ steps.cache-restore.outputs.cache-matched-key }}
+          CACHE_EXACT: ${{ steps.cache-restore.outputs.cache-hit == 'true' && 'true' || 'false' }}
         run: |
           cd "$CACHE_ROOT"
           echo "actions/cache 恢复自: ${RESTORED_FROM:-（无）}"
@@ -460,7 +460,6 @@ jobs:
           key: ${{ steps.cache-key.outputs.key }}
           path: |
             ${{ env.CACHE_ROOT }}/.ccache
-            ${{ env.CACHE_ROOT }}/build_dir/host
             ${{ env.CACHE_ROOT }}/staging_dir/host*
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
