@@ -1,386 +1,161 @@
 # PonWrt CI — Airoha AN758x PON 云编译
 
-基于 P3TERX `Actions-OpenWrt` 模板重构，源码指向 [pbs05/ponwrt](https://github.com/pbs05/ponwrt)（默认分支 `master`），
-针对 AN7581 / AN7583 PON 光猫做机型选择、磁盘释放与工具链缓存。
+基于 P3TERX `Actions-OpenWrt` 模板重构，源码指向 [pbs05/ponwrt](https://github.com/pbs05/ponwrt)（默认分支 `master`）。
+产出 AN7581 / AN7583 PON 光猫的 OpenWrt 固件，带机型选择、磁盘释放和滚动构建缓存。
 
-### diy-part1.sh —— 拉插件
+## 快速开始
 
-**默认开启**：
+免费 runner 单次上限 6 小时（job 350 分钟），首次全量编译（工具链 + 内核 + 全包）大概率超时，按这个顺序跑：
 
-| 开关 | 包 | 作用 |
-|------|-----|------|
-| `ADD_AIROHA_NPU` | `luci-app-airoha-npu` | Airoha SoC 状态页：NPU 卸载 / CPU 频率与超频 / Frame Engine / PPE 流表 |
+1. **Warm Build Cache** → `soc=an7581和an7583`、`prebuilt_host=预编译`，把工具链缓存建起来
+2. **Build PonWrt** → 选 `soc` / `profile` → `scope=firmware` 出固件
+3. 仍然超时：把 `configs/*.config` 里不需要的 luci-app / 语言包删掉再提交
 
+> 不预热也能直接跑 `firmware`——缓存是滚动式的，第一次跑完会自动存下工具链。预热只是给怕超时的人用的。
 
-| 包 | 作用 |
-|-----|------|
-| `luci-app-pon-status` | PON 光模块卡片：**温度 / 收光 / 发光 / 偏置电流 / 供电电压**，表格形式显示在概览页「系统」下一格 |
-| `luci-app-natmode` | NAT 类型三选一：**全锥形 NAT1 / 受限型 NAT3 / 全对称型 NAT4**，菜单「网络 → NAT 类型」 |
+## 输入项
 
-其余默认关闭：`ADD_PASSWALL` / `ADD_OPENCLASH` / `ADD_MOSDNS` / `ADD_LUCKY` /
-`ADD_TAILSCALE` / `ADD_OPENLIST` / `ADD_SMARTDNS`。
+### `build-ponwrt.yml`
 
-### luci-app-airoha-npu 的源与中文
-
-**源仓库：`luanmuc/luci-app-airoha-npu`**（`rchen14b` 的 fork 改进版）：
-
-| | rchen14b（原版）| luanmuc（本仓库选用）|
+| 输入 | 取值 | 说明 |
 |---|---|---|
-| 中文翻译 | ❌ po/ 只有 es + templates | ✅ 自带 `po/zh_Hans`，48 条全翻 |
-| 仓库结构 | ⚠ 根目录 + 同名子目录各一份，feed 索引会中断 | ✅ 单层，正常 |
-| luci.mk 路径 | 需 feeds 在固定位置 | ✅ 已修 |
+| `source` | `pbs05/ponwrt` / `fork` | 编译哪个源码仓库。**必须和缓存预热时选的一致**，否则前缀对不上 |
+| `branch` | 默认 `master` | |
+| `soc` | `an7581` / `an7583` | |
+| `profile` | 见下方机型表，`all` = 全机型 | 写错会在 `Validate configuration` 直接报错退出，不会静默全编 |
+| `scope` | `firmware` / `toolchain-only` | 后者只建工具链缓存，不出固件、不发 Release |
+| `prebuilt_host` | `true`（默认）/ `false` | `true` 用 runner 的 Go/Rust/LLVM，快 1.5~2.5 小时；`false` 全部从源码编，产物可复现 |
+| `ignore_cache` | `false` / `true` | 跳过缓存恢复强制重编（仍会存新一代） |
+| `upload_release` | `true` / `false` | `false` 只留 Artifact |
+| `opt_arm64ce` / `opt_chacha` / `opt_eip93` | `0` / `1` | 加密加速，见文末 |
 
-## PON 光模块卡片（概览页系统下一格）
+### 四个工作流
 
-| 字段 | 来源字段 | 单位 |
-|------|---------|------|
-| 收光功率 | `rx_power_dbm` | dBm |
-| 发光功率 | `tx_power_dbm` | dBm |
-| 光模块温度 | `temperature_celsius` | °C |
-| 偏置电流 | `tx_bias_ma` | mA |
-| 供电电压 | `voltage_volts` | V |
-
-### 开关：SHOW_PON_OPTICS
-
-`tempinfo` 顶部有一个开关：
-
-```sh
-SHOW_PON_OPTICS=1    # 温度行附带 PON 光功率/电流/电压
-SHOW_PON_OPTICS=0    # 只显示温度（CPU / WiFi / PON）
-```
-
-设为 `0` 时输出：`CPU: 58.7°C, WiFi: 46.0°C 48.0°C, PON: 48.5°C`
-
-本仓库**默认设为 `0`**，因为 `luci-app-pon-status` 卡片已用表格形式完整展示
-收发光/电流/电压，两者会重复。若你想只要一行、不装 pon-status 卡片，改回 `1` 即可。
-
-### 一点开销说明
-
-概览页轮询间隔 3 秒，故 `tempinfo` 每 3 秒执行一次 `ponctl`。
-`ponctl` 是 Rust 二进制、只读 sysfs，开销可忽略。
-但注意 `luci-app-pon-status` 卡片同样每 3 秒调一次 `ponctl`，
-两者叠加即约每 1.5 秒一次 `ponctl` 调用 —— 若在意，把 `SHOW_PON_OPTICS` 设 `0` 即可减半。
-
-## 概览页「CPU 使用率（%）」行：总量 USR/SYS + 每核占用
-
-ImmortalWrt 的 luci 默认只给一个总占用率（图左），改为下图右的样式：
-
-```
-CPU 使用率（%）   5%                                    ← 原来
-CPU 使用率（%）   USR: 2% SYS: 1% · CPU0 3% CPU1 0% CPU2 1% CPU3 5%
-```
-
-开头 `USR` / `SYS` 是总量；`CPU0 … CPU3` 依次是**每个核心的总占用率**（USR+SYS 合并）。
-
-### 原理（别改错文件）
-
-这一行是「前端渲染 + rpcd 取值」两段拼起来的，实际只改了后者：
-
-| 环节 | 文件 | 说明 |
-|------|------|------|
-| 文案 + 渲染 | `luci-mod-status/htdocs/.../view/status/include/10_system.js` | `_('CPU usage (%)'), cpuusage.cpuusage`，**不动** |
-| 取值 | `luci-base/root/usr/share/rpcd/ucode/luci` 的 `getCPUUsage` | 原本是 `top -n1 \| awk '/^CPU/ {printf("%d%", 100 - $8)}'` |
-| 授权 | `luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status.json` | 已授权 `luci [ "getCPUUsage" ]`，**不动** |
-| 数据源 | `files/sbin/cpuusage`（本仓库新增） | 两次 `/proc/stat` 采样求差值 |
-
-前端拿到什么就原样塞进单元格，`luci.getCPUUsage` 在 LuCI 里也只有这一个调用方
-（整个 immortalwrt/luci 里引用它的就上面三处），所以 `scripts/patch-luci-cpuusage.sh`
-只把 `popen()` 里的**那一个命令字符串**换掉即可 —— 补丁前后只差 1 行：
-
-```diff
--			const fd = popen('top -n1 | awk \'/^CPU/ {printf("%d%", 100 - $8)}\'');
-+			const fd = popen('sh /sbin/cpuusage');
-```
-
-**为什么走 `sh /sbin/cpuusage`**：直接 exec 要求脚本带可执行位，而这个位在
-Windows 打包 / 解压 / git checkout 链路上反复丢失（`luci-app-pon-status` 的
-`ponstat-conn` 踩过同一个坑）。经 `/bin/sh` 读脚本内容就不依赖它了。
-
-### 数值口径
-
-两次 `/proc/stat` 采样（间隔 `SAMPLE_DELAY`，默认 0.2 s）取差值，**不是**开机至今的平均值：
-
-| 显示 | 计算 |
-|------|------|
-| `USR` | `user + nice` |
-| `SYS` | `system + irq + softirq` |
-| `CPU<n>` | 该核的 `USR + SYS`，取 `/proc/stat` 的 `cpuN` 行 |
-
-每核那个数是**先合并 USR+SYS 再取整**，不是把上面的 `USR` / `SYS` 两个整数相加 ——
-各舍一次最多会多出 1%（实测 47.6% + 4.76% 会显示成 53%，真实值是 52%）。
-
-`guest` / `guest_nice` 不计入 —— 内核已把它们算在 `user` / `nice` 里，再加一次会重复计数。
-所以 `USR + SYS` 通常**小于**旧口径的 `100 - 空闲`（后者还含 iowait / nic 等），属正常。
-
-### 失败时的行为
-
-纯显示层的东西，任一环节不满足都只 `::warning::`，**不会让构建失败**：
-
-| 情况 | 表现 |
-|------|------|
-| `files/sbin/cpuusage` 不在源码树 | 跳过补丁，这一行维持原来的单个占用率 |
-| `feeds/` 下找不到 `*rpcd/ucode/luci`（换 fork / LuCI 版本不同） | 同上 |
-| 有 `getCPUUsage` 但命令行变了（上游改实现） | 同上，并提示同步本脚本的 `OLD_FIX` / `NEW_FIX` |
-| 脚本在设备上采样失败（`/proc/stat` 读不到等） | 脚本内部退回 `top -n1` 的旧口径，这一行永远有值 |
-
-想临时关掉：把 `diy-part2.sh` 里调用 `scripts/patch-luci-cpuusage.sh` 的那段注释掉即可。
-
-### 想换显示格式
-
-只改 `files/sbin/cpuusage` 里 awk 的 `END` 段（`sprintf` 那两行）就行，例如去掉每核明细
-只留总量：删掉拼 `cores` 的那一支即可。数值口径改 `SAMPLE_DELAY`（这行是纯变量，不必动 awk）。
-
-## Release 行为
-
-- 只有 `scope=firmware` 且编译成功才发 Release；`toolchain-only` 不发。
-- 空固件目录会跳过，不会发空 Release。
-- `fail_on_unmatched_files: false`：机型产物后缀不同（`*.itb` / `*.ubi` / `*.bin` / `*.manifest` 等），缺哪种都不会让这一步失败。
-- 自动清理：每个机型的 Release 只保留最近 10 个（`delete_tag_pattern: ^<DEVICE_NAME>-`）。
-- 关掉 Release 只留 Artifact：把 `upload_release` 选 `false`，或把 env 里 `UPLOAD_RELEASE` 默认值改成 `'false'`。
-
-> 首次运行建议先 `scope=toolchain-only`（不产固件、不发 Release）把工具链缓存建起来，再跑 `firmware`。
-> 现在缓存是滚动式的，**第一次 `firmware` 跑完也会自动存下工具链**，所以这一步只是给怕 6 小时超时的人用的。
-
-## 构建缓存（移植自 VIKINGYFY/OpenWRT-CI）
-
-一份缓存 = 三个目录，同一份内容存**两个地方**：
-
-```
-/workdir/openwrt/staging_dir/host*     host 工具 + hostpkg（go / python 在这）
-/workdir/openwrt/staging_dir/tool*     交叉编译器 toolchain-<board>_<subtarget>
-/workdir/openwrt/.ccache               编译对象缓存（USE_CCACHE=true 时才有内容）
-```
-
-| 通道 | 介质 | 特点 |
+| 工作流 | 触发 | 作用 |
 |---|---|---|
-| ① 快通道 | `actions/cache` | GitHub 内网，秒级；但 **7 天无访问即回收** |
-| ② 备份通道 | Release `cache-backup` 资产 | 走 `gh` 下载 ~1 GB，慢；**永不过期** |
-
-恢复顺序 ① → ②：① 没命中才去 ② 取，两条都没取到才真编译。保存时两条都写
-（② 失败只 `::warning::`，不影响构建结论）。
-
-| | key |
-|---|---|
-| 写入用 | `ponwrt-<源站>-<分支>-<SoC>-<上游提交号>` |
-| 恢复用 | `ponwrt-<源站>-<分支>-<SoC>-` **（前缀回退）** |
-
-**为什么这样就不会「永远 miss」**：前缀只由源站 / 分支 / SoC 决定，配置、机型、
-diy 脚本都不进 key。上游一提交就换一代，恢复时靠 `restore-keys` 回退到该前缀下
-最近的一代 —— 于是「命中」不再取决于两个地方算的指纹能不能对上。
-
-之前那套 `compile -> md5 指纹 -> 精确匹配` 已整体删除，原因是它只要指纹里有一项
-两端算得不一致（或者上游改了一行 `tools/` 的 Makefile），就退化成每次全量重编
-1~1.5 小时，而且没有任何自愈路径。
-
-**Release 备份怎么维护**：每次保存时先把新资产传上去，再删同前缀的旧代 ——
-顺序反过来的话，一旦上传失败就变成「旧的删了、新的没上去」，备份通道直接归零。
-单文件超过 2 GiB 会被 GitHub 拒，超限时只跳过备份、快通道照常。两条通道都不要时
-（比如想彻底重置）把 `release_backup` 选 `false`，并清空 Actions → Caches。
-
-恢复之后脚本会做三件事（`scripts/pwrt-cache.sh prepare`），缺一件就等于白命中：
-
-1. `touch` 所有**非 target** 的 stamp —— tar/zip 还原的是旧 mtime，源码树是刚 clone 的
-2. 写 `tmp/.build` —— 标记「构建环境已初始化」，否则 make 重走 prereq 阶段
-3. 目录本身也 touch —— 避免「目录比内容旧」
-
-### dl 缓存（源码包）
-
-单独一条，key 按**周**滚动：`ponwrt-dl-<源站>-<分支>-<YYYYWW>`，同样是前缀回退。
-
-- 保存位置在**编译之前**（`make download` 跑完就存）—— 因为 350 分钟超时会把 job
-  直接 cancel，放最后用 `always()` 也来不及跑，几个 G 的 dl 就白下了
-- 只在 `make download` 真跑成功时存，避免一份只含工具链源码的残缺 dl 占掉本周的 key
-- 轮换时 **dl 也参与**：按周号分组、只留最新一代。dl 是「只增不减」的，
-  新一代必定是旧一代的超集，留旧的只会白占 10GB 配额、把工具链缓存挤出去
-
-### 工具链缓存在什么时机写
-
-两处，key 相同，先成功的算数：
-
-1. **工具链刚编完就存一次**（`Build tools & toolchain` 之后）—— 因为 job 上限 350 分钟，
-   全量编译经常跑满；一旦超时被 cancel，排在编译后面的保存步骤根本没机会执行，
-   1~1.5 小时的工具链就白编了
-2. 编译成功后再存（只在第 1 步没存过时生效，否则同 key 会 `already exists`）
-
-### host 工具链：预编译 vs 源码真实编译
-
-`prebuilt_host` 这个输入决定 Go / Rust / LLVM 怎么来：
-
-| | `prebuilt_host=true`（默认） | `prebuilt_host=false` |
-|---|---|---|
-| Go | 用 runner 的 `/usr/lib/go-1.25` 做 bootstrap，最终 go 仍按 feed 版本自建 | 从 go1.4 起五段自举（+40~70 分钟） |
-| Rust | 用 runner 的 rustup stable（0 秒） | 从源码自举 rustc（+30~60 分钟） |
-| LLVM/BPF | 用 runner 的 `llvm-18` | OpenWrt 自己编 llvm-bpf（+20~40 分钟） |
-| host Python | 关 PGO（快） | 保持上游默认（带 PGO） |
-| 首次构建 | 快 1.5~2.5 小时 | 慢，但产物与「完全按上游从源码构建」一致 |
-| 之后的构建 | 靠缓存，两者一样快 | 靠缓存，两者一样快 |
-
-**两种模式不共用缓存**：`HOST_MODE`（`prebuilt` / `source`）会进缓存前缀，
-形如 `ponwrt-<源站>-<分支>-<SoC>-<prebuilt|source>`。
-原因很实在 —— 预编译模式在 `staging_dir` 里留的是**指向 runner 的符号链接**，
-源码模式留的是**真二进制**；混用会让 make 误判「已安装」，
-然后在编译期报一个完全对不上的错。
-
-所以切模式等于换一条缓存线，两边各自滚动、互不污染。`warm-cache.yml` 也有同一个
-输入，**必须和主流程选一样的值**，否则前缀不同、预热白跑。
-
-### rust 包的离线限制（`--frozen`）
-
-`h3c-fttr-tools` 的 Makefile 里是 `cargo install ... --locked --frozen`。
-`--frozen` = 锁定版本 **+ 禁止联网**，只认 `CARGO_HOME=dl/cargo` 里已有的 crate。
-而 `dl/cargo` 是从缓存继承的（只增不减），包上游一旦在 `Cargo.lock` 里加新依赖，
-缓存里就没有它：
-
-```
-failed to download `core_detect v1.0.0`
-attempting to make an HTTP request, but --frozen was specified
-```
-
-`scripts/patch-cargo-offline.sh` 在 `diy-part1.sh` 之后把这些 Makefile 里的
-`--frozen` / `--offline` 摘掉（**`--locked` 保留**，版本仍锁死在 Cargo.lock，
-结果可复现；去掉的只是「不许联网」这一条）。
-
-> 更正统的做法在私有包侧：`Build/Prepare` 里显式 `cargo fetch --locked`
-> 把 crate 拉进 `CARGO_HOME`，编译阶段再用 `--frozen`。两者可以共存。
-
-### `make download` 失败不再被吞掉
-
-以前是「试 3 次，失败也继续」，于是下载不全的问题一直拖到编译阶段才爆，
-报的还是完全不相干的错（上面那条 `cargo` 报错就是典型）。现在三次都失败会直接
-`::error::` 退出，并提示去 make download 输出里搜 `ERROR:` / `failed to download`。
-
-配套的四个工作流：
-
-| 工作流 | 作用 |
-|---|---|
-| `build-ponwrt.yml` | ①→② 恢复 → 编译 → **成功后两处都存** → `cache-rollover` job 删掉同前缀的旧代 |
-| `warm-cache.yml` | 每周一预热/保活；key 口径与主流程同源（都调 `scripts/pwrt-cache.sh`） |
-| `cache-keepalive.yml` | 每 3 天真实恢复一次，避开 7 天未访问回收 |
-| `cache-clean.yml` | 手动/定时清理：`rollover` 每个族只留最新一代（工具链按提交号、dl 按周号分组）、`backup` 清 Release 旧代、`all` 全删 |
-
-`ignore_cache=true` 会跳过恢复强制重编（仍会存新一代）。
-
-> 迁移提示：更早那版的 `toolchain-cache` / `staging-cache` 两个 Release 已经不再被任何流程使用，
-> 可以在 Releases 页面手动删掉；现在统一用 `cache-backup`（`Remove old releases` 按机型名匹配，不会碰它）。
+| `build-ponwrt.yml` | 手动 | 恢复缓存 → 编译 → 存缓存 → 轮换旧代 |
+| `warm-cache.yml` | 手动 / 每周一 03:17 | 预热。`soc` 和 `prebuilt_host` 都是三选一，两个都选「和」的选项 = 4 个 job 并行 |
+| `cache-keepalive.yml` | 每 3 天 | 逐条真实恢复，避开 `actions/cache` 的 7 天未访问回收 |
+| `cache-clean.yml` | 手动 / 每周一 04:20 | `rollover` 每族留最新一代 / `backup` 只清 Release 备份 / `all` 全删 |
 
 ## 支持的机型
 
 | SoC | profile |
-|-----|---------|
-| AN7581 | `fiberhome_hg5382a` `fiberhome_hg5585f-ct` `fiberhome_hg5585f-cu` `gemtek_xg2010g` `nokia_xg-040g-md-ubi` `nokia_xg-040g-tf-ubi` `unionman_ung00a` `znxt_zn504xg-d` `znxt_zn515xg-d` |
+|---|---|
+| AN7581 | `fiberhome_hg5382a` `fiberhome_hg5585f-ct` `fiberhome_hg5585f-cu` `gemtek_xg2010g` `nokia_xg-040g-md-ubi` `nokia_xg-040g-tf-ubi` `unionman_ung00a` `znxt_zn504xg-d` `znxt_zn515xg-d` `h3c_hm2004-du`※ |
 | AN7583 | `nokia_xg-040g-mf` `nokia_xg-040g-mf-ubi` |
 
-机型名写错会在 `Validate configuration` 步骤直接报 `::error::` 并退出，不会静默地全机型编译。
+※ `h3c_hm2004-du` 额外依赖私有仓库 `openwrt-fttr`（FTTR 驱动 / 控制端 / FPGA 固件）与 `luci-app-fttr`，缺凭证时 `diy-part1.sh` 会直接报错退出。
+
+## 插件开关（`diy-part1.sh`）
+
+**默认开启**：`ADD_AIROHA_NPU`（`luci-app-airoha-npu`，NPU 卸载 / CPU 频率 / Frame Engine / PPE 流表）、`ADD_LUCI_APP`（`luci-app-natmode` NAT 类型三选一 + `luci-app-pon-status` 光模块表格）。
+
+`ADD_FTTR` 及其子开关只在 `h3c_hm2004-du` 下生效，其余机型自动跳过。
+
+**默认关闭**：passwall / openclash / mosdns / lucky / tailscale / openlist / smartdns / easytier / wol / watchdog / taskplan / oaf / fluent 主题。
+要用哪个，改两处：脚本里对应 `ADD_xxx=true`，**并且**在 `configs/<机型>.config` 里把 `CONFIG_PACKAGE_xxx` 改成 `=y`。只改一处等于「拉下来了但没编进去」。
+
+> `ADD_SMARTDNS` / `ADD_PASSWALL` 拉的是与 feeds 同名的包（`pymumu/smartdns`、passwall 系列），
+> 同时打开会出现两份同名包，最终用哪份取决于扫描顺序——已经在 config 里打开这些包时优先用 feeds 的。
+
+## 构建缓存（移植自 VIKINGYFY/OpenWRT-CI）
+
+一份缓存 = 三个目录，同一份内容存两个地方：
+
+```
+staging_dir/host*      host 工具 + hostpkg（go / python 在这）
+staging_dir/tool*      交叉编译器
+.ccache                编译对象缓存
+```
+
+| 通道 | 介质 | 特点 |
+|---|---|---|
+| ① 快通道 | `actions/cache` | 秒级，但 **7 天无访问即回收** |
+| ② 备份通道 | Release `cache-backup` 资产 | 慢（~1 GB），**永不过期** |
+
+恢复 ①→②，保存时两条都写（② 失败只 warning）。key 规则：
+
+| | key |
+|---|---|
+| 写入 | `ponwrt-<源站>-<分支>-<SoC>-<prebuilt\|source>-<上游提交号>` |
+| 恢复 | 同上前缀 + `-`（**前缀回退**） |
+
+前缀不含配置、机型、diy 脚本——改这些不会让缓存失效；上游一提交就换一代，靠 `restore-keys` 回退到最近一代。旧代由 `cache-rollover` job 删掉，保证每个前缀只留一份。
+
+**恢复后必须做三件事**（`scripts/pwrt-cache.sh prepare`），少一件就等于白命中：touch 非 target 的 stamp、写 `tmp/.build`、touch 目录本身。
+
+**dl 缓存**（源码包，2~5 GB）单独一条，key 按周滚动 `ponwrt-dl-<源站>-<分支>-<YYYYWW>`。保存在 `make download` 之后、编译之前——350 分钟一到 job 直接 cancel，放最后用 `always()` 也来不及跑。
+
+**两种 host 模式不共用缓存**：`HOST_MODE` 进前缀。prebuilt 在 `staging_dir` 里留的是指向 runner 的符号链接，source 留的是真二进制，混用会让 make 误判「已安装」并在编译期报一个完全对不上的错。**warm-cache 必须和主流程选同一个模式**，否则预热白跑。
+
+**rust 包的离线限制**：`h3c-fttr-tools` 的 Makefile 用 `cargo install --locked --frozen`，`--frozen` 禁止联网、只认 `dl/cargo` 里已有的 crate。`scripts/patch-cargo-offline.sh` 把 `--frozen` / `--offline` 摘掉，`--locked` 保留（版本仍锁死）。
+
+## 客制化
+
+| 位置 | 做了什么 |
+|---|---|
+| `files/sbin/cpuusage` + `scripts/patch-luci-cpuusage.sh` | 概览页 CPU 行改为 `USR: 2% SYS: 1% · CPU0 3% CPU1 0%…`（两次 `/proc/stat` 采差值，USR=`user+nice`、SYS=`system+irq+softirq`）。补丁只换 `popen()` 里一个命令字符串，前端和 ACL 都不动；任一环节失败只 warning，构建不受影响 |
+| `files/sbin/tempinfo` | 概览页温度行：CPU / WiFi / PON 三个温度。顶部 `SHOW_PON_OPTICS=1` 可附带收发光/电流/电压（默认 0，因为 `luci-app-pon-status` 卡片已经完整展示，重复） |
+| `diy-part2.sh` | 默认时区 `Asia/Shanghai`、5G 国家码 `CN` / 信道 `auto` / 频宽 `HE160`（不支持时回落到 `HE80`）、固件版本后缀追加作者与构建时间 |
+| `files/etc/uci-defaults/` | 首启强制刷时区与无线参数的兜底脚本 |
 
 ## NPU 固件
 
-NPU 是 Airoha SoC 里那颗 RISC-V 核，**不是** Linux 驱动 —— host 端驱动 `airoha_npu`
-随内核编出，它按固定名字找两个固件镜像：
+NPU 是 Airoha SoC 里的 RISC-V 核，host 侧驱动随内核编出，按固定名字找两个镜像：
 
-| 镜像 | 默认文件名 | 上限 | 加载去向 |
-|---|---|---|---|
-| rv32（text+rodata） | `airoha/en7581_npu_rv32.bin`（AN7583 为 `an7583_*`） | 2 MiB | `npu_binary` @0x84000000 |
-| data（.data） | `airoha/en7581_npu_data.bin` | 64 KiB | NPU 本地 SRAM |
+| 镜像 | 文件名 | 上限 |
+|---|---|---|
+| rv32（text+rodata） | `airoha/en7581_npu_rv32.bin`（AN7583 为 `an7583_*`） | 2 MiB |
+| data | `airoha/en7581_npu_data.bin` | 64 KiB |
 
-固件由 ponwrt 自带的 linux-firmware 包提供（`airoha-en7581-npu-firmware` /
-`airoha-an7583-npu-firmware`），在 `configs/<机型>.config` 里写
-`CONFIG_PACKAGE_airoha-en7581-npu-firmware=y` 即会装进 rootfs。
-
-工作流**不介入**固件的生成与选择：不再有现编、变体推断、DEFAULT_PACKAGES 摘除
-等环节。要换固件就改 config 里那一行，改完照常 `make defconfig` 生效。
-
-### 刷完怎么验
+由 ponwrt 自带的 linux-firmware 提供，在 `configs/<机型>.config` 写 `CONFIG_PACKAGE_airoha-en7581-npu-firmware=y` 即装进 rootfs。工作流不介入固件生成——要换就改这一行。
 
 ```sh
-dmesg | grep -i npu           # probe 时打 NPU fw version
+dmesg | grep -i npu           # probe 时打 fw version
 ls -l /lib/firmware/airoha/   # 两个 bin 在位
 ```
 
-- 缺文件或名字不匹配：`request_firmware_direct()` 返回 `-ENOENT`，驱动映射成
-  `-EPROBE_DEFER`，NPU 一直不绑定（`deferred probe pending` 里能看到具体文件名）。
-- 大小超限：直接 `-E2BIG`。
-- LuCI「Airoha SoC 状态页」（`luci-app-airoha-npu`）可看 NPU 卸载 / PPE 流表是否正常。
+缺文件或名字不符 → `-ENOENT` → 映射成 `-EPROBE_DEFER`，NPU 一直不绑定（`deferred probe pending` 里能看到具体文件名）；超限 → `-E2BIG`。
 
+## 加密加速（可选）
 
-## 首次使用建议
+| 开关 | 建议 | 适用 |
+|---|---|---|
+| `opt_arm64ce` | 改 `1` | IPSec / OpenVPN / TLS / dm-crypt，几乎总是开 |
+| `opt_chacha` | 改 `1` | 跑 Xray / sing-box / WireGuard |
+| `opt_eip93` | 保持 `0` | 只有大块 IPSec / 大文件 TLS 才有收益 |
 
-免费 runner 单次上限 6 小时，首次全量编译（工具链 + 内核 + 全包）大概率超时：
+**AN7581 和 AN7583 不一样**：AN7581 的 `/proc/cpuinfo` 里没有 `aes`，`/proc/crypto` 只有 `aes-generic`，单核 AES-128-GCM 约 32 MB/s，只能走 NEON 位切片（`AES_ARM64_BS`）；AN7583 有 `aes pmull sha1 sha2`，同样测试约 548 MB/s，可以走 Crypto Extensions。脚本读 `.config` 自动判断，不用手动切。
 
-1. 先跑一次 `scope = toolchain-only`，把工具链缓存建起来；
-2. 再跑一次 `scope = firmware` 出固件；
-3. 若仍超时，把 `configs/*.config` 里不需要的 luci-app / 语言包删掉再提交。
+**EIP93 是个陷阱**：AN7581 确实内置（`crypto@1e004000`），但实测 AES 要 ≥512 字节才快过软件，MD5/SHA1/SHA2 在所有尺寸下都是软件更快，代理流量开着只会更慢。
 
----
-
-## AN758X 加密加速可选包
-
-### 三个开关怎么选
-
-| 开关 | 默认 | 什么时候开 | 谁受益 |
-|---|---|---|---|
-| `OPT_CRYPTO_ARM64CE` | 0（建议改 1） | 几乎总是开 | IPSec、OpenVPN、TLS、dm-crypt |
-| `OPT_CRYPTO_CHACHA` | 0（建议改 1） | 跑 Xray / sing-box / WireGuard | 出海类代理流量 |
-| `OPT_CRYPTO_EIP93` | 0 | 只在跑大块 IPSec / 大文件 TLS | 反而是最不需要的那个 |
-
-### 为什么这么分
-
-**AN7581 和 AN7583 不一样**，这是整个事情的关键：
-
-- AN7581（ZN504XG-D、XG-040G-MD 等）`/proc/cpuinfo` 里**没有 `aes`**，`/proc/crypto` 只有 `aes-generic`，单核 AES-128-GCM 约 32 MB/s。它只能走 NEON 位切片（`AES_ARM64_BS`）。
-- AN7583（XG-040G-MF）**有 `aes pmull sha1 sha2`**，同样测试能到约 548 MB/s，可以走 Crypto Extensions（`AES_ARM64_CE`）。
-
-脚本会自动读 `.config` 判断 SoC，分别写两套内核符号，不用你手动切。
-
-**EIP93 是个陷阱。** AN7581 确实内置了 EIP93（`crypto@1e004000`），驱动也在主线 `inside-secure/eip93` 里。但在 W1700K2（AN7581）上实测：AES 要 512 字节以上才比软件快，而 MD5 / SHA1 / SHA2 在所有尺寸下都是软件更快（阈值 -1）。代理流量几乎全是大大小小的包，开了只会更慢。所以默认关。
-
-**ChaCha 才是出海的正解。** Xray、sing-box 的 AEAD 优先用 ChaCha20-Poly1305，它不吃 AES 指令——你可以显式把 method 设成 `chacha20-ietf-poly1305`，比在 AN7581 上硬跑 AES 划算得多。
-
-### 安装
-
-1. 把 `01-diy-part2-crypto.sh` 放到 `scripts/` 下（或整体追加到 `diy-part2.sh` 末尾）。
-   若放 `scripts/`，在 `diy-part2.sh` 末尾加一行：
-
-   ```sh
-   [ -f scripts/diy-part2-crypto.sh ] && . ./scripts/diy-part2-crypto.sh
-   ```
-
-2. 把 `02-workflow-inputs.yml` 里的 inputs 合并进你的 `.github/workflows/*.yml`。
-   **只加 inputs 不够，必须同时加 `env:` 那段**，否则脚本读到的永远是 0。
-
-3. 不想动 workflow 也能用：直接在 workflow 的 `env:` 里写死
-
-   ```yaml
-   env:
-     OPT_CRYPTO_ARM64CE: '1'
-     OPT_CRYPTO_CHACHA: '1'
-     OPT_CRYPTO_EIP93: '0'
-   ```
-
-### 刷完后验证
+验证：
 
 ```sh
-# 1. 看指令集（AN7581 不会有 aes，AN7583 会有）
-grep -ao 'aes\|pmull\|sha1\|sha2' /proc/cpuinfo | sort -u
-
-# 2. 看内核注册了哪些实现
+grep -ao 'aes\|pmull\|sha1\|sha2' /proc/cpuinfo | sort -u   # AN7581 不会有 aes
 cat /proc/crypto | grep -E '^name|^driver|^priority'
-
-# 3. 跑分对比
 openssl speed -evp aes-128-gcm
 openssl speed -evp chacha20-poly1305
 ```
 
-开 `OPT_CRYPTO_EIP93` 后额外看一眼是否真的挂上了：
+> `CONFIG_CRYPTO_*` 是**内核编译符号**，必须写进 `target/linux/airoha/an7581/config-<kver>`。写进顶层 `.config` 会被 target config 覆盖——看起来配上了，实际不生效。
 
-```sh
-dmesg | grep -i eip93
-lsmod | grep eip93
-```
+## 排错
 
-### 注意事项
+| 症状 | 先看哪里 |
+|---|---|
+| `defconfig` 失败 | 日志里 `make defconfig` 那段的尾部 60 行 + 根因提示（`scripts/defconfig.sh` 输出） |
+| 关键包「未启用，检查 feeds」 | 多数是上一步 defconfig 失败的连带；独立出现时查 `tmp/.packageinfo` 里有没有该包 |
+| `Failed to download` / 编译期报缺 crate | `make download` 三次都失败会直接 error 退出，去那段输出搜 `ERROR:` |
+| 缓存「命中」却仍然全量重编 | `prepare` 那步的三件事是否都做了；`Build host go/rust from source` 的 warning |
+| 缓存永远 miss | `source` / `branch` / `soc` / `prebuilt_host` 四项是否和预热时一致 |
+| `artifacts` 上传失败 | Artifact 存储配额（默认保留 90 天，几份固件就可能超） |
+| NPU 不绑定 | `dmesg \| grep -i npu`、`/lib/firmware/airoha/` 里的文件名和大小 |
 
-- `CONFIG_CRYPTO_*` 是**内核编译符号**，必须写进 `target/linux/airoha/an7581/config-<kver>`。写进顶层 `.config` 会被 target config 覆盖，看起来配置成功了实际不生效——脚本里就是这么处理的。
-- `kmod-crypto-hw-eip93` 的依赖是 `@(TARGET_ramips_mt7621||TARGET_airoha)`，airоha 全系可编。内核 ≥6.18 走主线 in-tree 驱动（`inside-secure/eip93`），<6.18 走 `mtk-eip93`，包会自动选，你不用管。
-- Xray / sing-box 本身不在官方 feed，得先在 `feeds.conf.default` 加第三方源。用户态加密提速靠 ChaCha，不是靠 EIP93。
-- NPU 只在三层路由模式生效，当纯 AP 桥接时整机吞吐会掉到 2000 Mbps 左右——这跟加密无关，但经常一起被误判。
+## 已知限制
 
+- 只有 `scope=firmware` 且编译成功才发 Release；`toolchain-only` 不发，空固件目录会跳过。
+- Release tag 固定为 `<机型>-<分支>`，每次覆盖，所以每个机型只有一份固件，不是「保留最近 N 份」。
+- NPU 只在三层路由模式生效，纯 AP 桥接时整机吞吐会掉到 2000 Mbps 左右。
+- `repository_dispatch` 触发时所有 choice 输入都是空，走的是各 env 的回退值。
