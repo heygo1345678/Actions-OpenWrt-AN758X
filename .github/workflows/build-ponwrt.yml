@@ -42,16 +42,6 @@ env:
   # 用 runner 预装的 rust stable（0 秒）还是按 feed 里 pin 的版本另装一个
   # （1~3 分钟）。默认 false：功能等价、省时间；要求产物可复现时改 true。
   RUST_PIN_FEED: false
-
-  # =========================================================
-  # 整体构建缓存 —— 移植自 VIKINGYFY/OpenWRT-CI 的滚动缓存
-  #   一份 = staging_dir/host* + staging_dir/tool* + .ccache
-  #   key = ponwrt-<源站>-<分支>-<SoC>-<HOST_MODE>-<提交号>，回退键为同前缀 + "-"
-  # ★ 前缀永远稳定、只有提交号会变，所以「命中」不取决于两端指纹能否对上。
-  #   两条通道：① actions/cache（快，7 天无访问回收）② Release（慢，永久）；
-  #   恢复 ①→②，保存两条都写（② 失败只 warning）。
-  # ⚠ with.path 不接受 GITHUB_ENV 动态值，必须在这里静态写死。
-  # =========================================================
   CACHE_ROOT: /workdir/openwrt
   CACHE_RELEASE: cache-backup
   RELEASE_BACKUP: ${{ github.event.inputs.release_backup == 'false' && 'false' || 'true' }}
@@ -291,13 +281,6 @@ jobs:
           # 若传入的 soc 与机型冲突，以机型为准
           echo "SOC=$SOC" >> "$GITHUB_ENV"
           echo "PROFILE=$PROFILE" >> "$GITHUB_ENV"
-          # 末尾带上 host 模式：source / prebuilt 两条线并行跑时，固件与
-          # artifact 不再互相覆盖。
-          # DEVICE_NAME 同时决定下面三处，改这一个地方就够：
-          #   · artifact 名 OpenWrt_firmware_${DEVICE_NAME}${FILE_DATE}
-          #   · Release tag  ${DEVICE_NAME}-${REPO_BRANCH}
-          #   · 旧 tag 清理   delete_tag_pattern: ^${DEVICE_NAME}-
-          # 固件文件名不受影响（前缀由 OpenWrt 的 CONFIG_VERSION_DIST 决定）。
           echo "DEVICE_NAME=ponwrt-${SOC}-${PROFILE}-${HOST_MODE}" >> "$GITHUB_ENV"
           # 每机型一份 config；profile=all 时回退到 SoC 通用配置
           if [ "$PROFILE" = "all" ]; then
