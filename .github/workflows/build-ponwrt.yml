@@ -32,14 +32,10 @@ env:
 
   # =========================================================
   # host 侧 go / rust / llvm 怎么来
-  #
-  #   prebuilt（默认）：用 runner 预装的，省 1.5~2.5 小时；
-  #                     代价是版本跟着镜像走，产物不可复现
-  #   source          ：全部从源码真实编译（OpenWrt 原生行为），
-  #                     首次 +1.5~2.5 小时，之后靠缓存
-  #
-  #   ★ 两种模式的产物形态不同（符号链接 vs 真二进制），所以
-  #     HOST_MODE 会进缓存前缀 —— 换模式等于换一条缓存线，互不影响。
+  #   prebuilt（默认）用 runner 预装的，省 1.5~2.5 小时，版本随镜像走；
+  #   source 全部源码编，慢但可复现。
+  # ★ 两者产物形态不同（符号链接 vs 真二进制），HOST_MODE 必须进缓存前缀，
+  #   否则切模式会命中对方的产物 → make 认为「已安装」→ 编译期报不相干的错。
   # =========================================================
   PREBUILT_HOST: ${{ github.event.inputs.prebuilt_host == 'false' && 'false' || 'true' }}
   HOST_MODE: ${{ github.event.inputs.prebuilt_host == 'false' && 'source' || 'prebuilt' }}
@@ -49,23 +45,13 @@ env:
 
   # =========================================================
   # 整体构建缓存 —— 移植自 VIKINGYFY/OpenWRT-CI 的滚动缓存
-  #
-  #   一份缓存 = staging_dir/host* + staging_dir/tool* + .ccache
-  #   key       = ponwrt-<源站>-<分支>-<SoC>-<上游提交号>
-  #   回退键   = ponwrt-<源站>-<分支>-<SoC>-
-  #
-  #   ★ 关键在于 key 里【只有】提交号会变，前缀永远稳定：
-  #     上游一提交就换一代，恢复时靠前缀回退总能拿到最近一代，
-  #     所以「有没有命中」不再取决于我们自己算的指纹能不能对上。
-  #     以前那套 md5 指纹 + 精确匹配已经拿掉了。
-  #
-  #   两条通道，同一份内容、同一套 key：
-  #     ① actions/cache  —— 快（GitHub 内网），但 7 天无访问会被回收
-  #     ② Release 备份   —— 慢（走 gh 下载 ~1GB），但永不过期
-  #   恢复顺序 ① → ②：① 没命中才去 ② 取；两条都没取到才真编译。
-  #   保存时两条都写（② 失败只 warning，不影响构建结论）。
+  #   一份 = staging_dir/host* + staging_dir/tool* + .ccache
+  #   key = ponwrt-<源站>-<分支>-<SoC>-<HOST_MODE>-<提交号>，回退键为同前缀 + "-"
+  # ★ 前缀永远稳定、只有提交号会变，所以「命中」不取决于两端指纹能否对上。
+  #   两条通道：① actions/cache（快，7 天无访问回收）② Release（慢，永久）；
+  #   恢复 ①→②，保存两条都写（② 失败只 warning）。
+  # ⚠ with.path 不接受 GITHUB_ENV 动态值，必须在这里静态写死。
   # =========================================================
-  # actions/cache 的 with.path 不接受 GITHUB_ENV 动态值，必须 workflow 级静态
   CACHE_ROOT: /workdir/openwrt
   CACHE_RELEASE: cache-backup
   RELEASE_BACKUP: ${{ github.event.inputs.release_backup == 'false' && 'false' || 'true' }}
@@ -80,20 +66,12 @@ env:
   FW_DESC_SUFFIX: ''               # 留空 = "· qwe · <构建时间>"；填了则完全自定义
 
   # =========================================================
-  # 加密加速开关（★ 本次新增，写在这里才是 workflow 级 env）
-  #
-  # ⚠ 用 github.event.inputs 而不是 inputs：本文件可被 repository_dispatch
-  #   触发，那种触发下 inputs 上下文不可靠，而文件里其余 env 项（SOURCE /
-  #   REPO_URL / BUILD_SCOPE…）统一都用 github.event.inputs，保持一致。
-  #
-  # ⚠ 默认值不能用 "|| " 兜：GitHub 表达式里字符串 '0' 会被转成数字 0 判为假，
-  #   `${{ github.event.inputs.x || '1' }}` 在用户显式选 0 时会错误地返回 '1'。
-  #
-  # ⚠ 也不能用 "!= '0'" 兜：本文件有 repository_dispatch 触发器，那种触发下
-  #   github.event.inputs.* 为 null，null 在字符串比较里被当成空串 ''，
-  #   '' != '0' 成立 → 返回 '1'。也就是说声明的 default: '0' 完全失效，
-  #   repository_dispatch / API 重跑时开关会被静默打开。
-  #   三个开关统一用 "== '1'"：只有显式传 '1' 才开，其余（0 / 空 / null）全关。
+  # 加密加速开关
+  # ⚠ 一律用 github.event.inputs（本文件可被 repository_dispatch 触发，
+  #   那种触发下 inputs 上下文不可靠）。
+  # ⚠ 三个开关统一写 `== '1' && '1' || '0'`，不能用 `|| '0'` 兜：'0' 会被
+  #   转成数字 0 判假；也不能用 `!= '0'` 兜 —— inputs 为 null 时按空串处理，
+  #   '' != '0' 成立，声明的 default 失效、开关被静默打开。
   # =========================================================
   OPT_CRYPTO_ARM64CE: ${{ github.event.inputs.opt_arm64ce == '1' && '1' || '0' }}
   OPT_CRYPTO_CHACHA:  ${{ github.event.inputs.opt_chacha  == '1' && '1' || '0' }}
@@ -424,16 +402,10 @@ jobs:
 
       # =========================================================
       # 2.2 构建缓存：恢复
-      #
-      #   ★ 这是整套加速的核心，两个细节不能改：
-      #     key          精确的「前缀+提交号」
-      #     restore-keys 前缀 + "-"，靠它回退到最近一代
-      #   只有 restore-keys 存在，才会出现「提交号变了但依然命中上一代」，
-      #   也就是缓存永远有效、且随每次构建自动向前滚动。
-      #
-      #   ⚠ path 用通配：host* 同时覆盖 host 与 hostpkg（go / python 在这），
-      #     tool* 覆盖 toolchain-<board>_<subtarget>。
-      #     不缓存 staging_dir/target-*：那是固件包安装产物，每次都要重来。
+      #   key 精确到提交号，restore-keys 用前缀 + "-" 回退 —— 有它才有
+      #   「提交号变了仍命中上一代」，缓存随每次构建自动向前滚动。
+      # ⚠ host* 同时覆盖 host 与 hostpkg（go / python 在这），tool* 覆盖
+      #   toolchain-*。不缓存 target-*：那是固件包安装产物，每次都要重来。
       # =========================================================
       - name: Restore build cache
         id: cache-restore
@@ -448,16 +420,11 @@ jobs:
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
       # =========================================================
-      # 2.3 构建缓存：Release 备份通道（① 没命中才走）
-      #
-      #   为什么还要这条：actions/cache 的条目 7 天没人访问就被回收，
-      #   7 天规则卡的是「最后访问时间」而不是「创建时间」。仓库不是
-      #   每天编译，赶上停摆一周，快通道就空了 —— 那时从 Release 取，
-      #   仍然不用冷编译。
-      #
-      #   ★ 取「该前缀下创建时间最新」的那一份，而不是精确 key：
-      #     与 actions/cache 的前缀回退同义，提交号变了也照样能用。
-      #   ★ 先上传新的再删旧的（见 Save 步骤），任何时刻都至少有一份在。
+      # 2.3 Release 备份通道（① 没命中才走）
+      #   7 天回收卡的是「最后访问」而不是「创建」，仓库常常停摆一周以上，
+      #   快通道会空；此时从 Release 取，仍然不用冷编译。
+      # ⚠ 取该前缀下最新的一份（与前缀回退同义），且先传新的再删旧的，
+      #   任何时刻都至少有一份在。
       # =========================================================
       - name: Restore cache from Release backup
         id: release-restore
@@ -532,23 +499,13 @@ jobs:
           bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" prepare "$CACHE_ROOT"
 
       # =========================================================
-      # 2.5 私有仓库凭证（openwrt-fttr feed 的来源）
-      #
-      # 凭证优先级：GitHub App 安装令牌 > Secret 里的 PAT
-      #   App 令牌：1 小时有效、仅限白名单仓库、contents 只读、job 结束自动吊销，
-      #             泄露窗口和权限面都比长期 PAT 小一个量级。
-      #
-      # 注入方式：GIT_ASKPASS（而不是 git insteadOf）
-      #   令牌写进 $RUNNER_TEMP/gh_token（600），git 被要求认证时才由 askpass
-      #   读出来。好处：令牌不进命令行、不写进 ~/.gitconfig、不出现在后续
-      #   步骤的 env 里；diy-part1.sh 的 clone URL 保持裸 URL，一行都不用改。
-      #   ⚠ 别再拼 user:token@ 或写 url.*.insteadOf —— 那会落盘到 git config，
-      #     还会和 checkout 注入的 extraheader 抢优先级（后者写本地 .git/config，
-      #     本地优先级更高，会直接盖掉令牌 → 404 Repository not found）。
-      #
-      # PAT 回退：secrets.PRIVATE_REPO_TOKEN > secrets.FTTR_TOKEN（旧名兼容）
-      # ⚠ workflow_dispatch 的输入值会明文出现在 run 页面、也能被 API 读到，
-      #   所以不设令牌输入框，长期凭证只放 Secret。
+      # 2.5 私有仓库凭证（openwrt-fttr feed 来源）
+      #   优先级：GitHub App 安装令牌（1 小时、单仓库、只读、自动吊销）
+      #           > Secret 里的 PAT
+      # ⚠ 注入走 GIT_ASKPASS，不要拼 user:token@ 也不要写 url.*.insteadOf：
+      #   后者会落盘到 git config，还会和 checkout 注入的 extraheader 抢优先级
+      #   （本地 .git/config 更高，直接盖掉令牌 → 404 Repository not found）。
+      # ⚠ 不设令牌输入框：workflow_dispatch 的输入会明文出现在 run 页面。
       # =========================================================
 
       # ---------------------------------------------------------
@@ -760,17 +717,11 @@ jobs:
           exit "$FAIL"
 
       # =========================================================
-      # 3. dl 下载缓存（源码包，2~5 GB，长期累计）
-      #
-      #   ⚠ 原来用 actions/cache@v5 的 save-always，指望「编译失败也保住
-      #     dl」。但查了 v5 的 action.yml：save-always 已标记 deprecated，
-      #     原文是「does not work as intended」，实际仍走 post 步骤的
-      #     post-if: success() —— 也就是说构建一失败，这一趟下的几个 G
-      #     全白下。所以改成显式的 restore + save 两步。
-      #
-      #   key 按周滚动、restore-keys 前缀回退：dl 是【只增不减】的，
-      #   每周那份都是上一周的超集，所以轮换时只留最新一份就够
-      #   （见 scripts/cache-roll.jq 对 -YYYYWW 后缀的处理）。
+      # 3. dl 下载缓存（源码包，2~5 GB）
+      # ⚠ 不能用 actions/cache 的 save-always（v5 已 deprecated，原文
+      #   "does not work as intended"，实际仍走 post-if: success()）——
+      #   构建一失败，这一趟下的几个 G 就白下了。所以显式 restore + save。
+      #   key 按周滚动、前缀回退，轮换只留最新一份（dl 只增不减，新的是超集）。
       # =========================================================
       - name: Restore dl cache
         id: dl-restore
@@ -809,19 +760,10 @@ jobs:
 
       # =========================================================
       # 5.5 放宽 rust 包的「禁止联网」（--frozen / --offline）
-      #
-      #   h3c-fttr-tools 的 Makefile 写的是
-      #     cargo install ... --locked --frozen
-      #   --frozen = 锁定版本 + 禁止联网，只认 CARGO_HOME(dl/cargo) 里已有的 crate。
-      #
-      #   而 dl/cargo 是从构建缓存继承的（只增不减），包上游一旦在
-      #   Cargo.lock 里加新依赖（这次是 core_detect v1.0.0），缓存里没有：
+      #   dl/cargo 是从缓存继承的（只增不减），上游在 Cargo.lock 加新依赖时
+      #   缓存里没有 → `--frozen` 不给补救机会，编到 rust 包必挂：
       #     failed to download `core_detect v1.0.0`
-      #     attempting to make an HTTP request, but --frozen was specified
-      #   —— 编译到 rust 包必挂，且 --frozen 不给任何补救机会。
-      #
-      #   这里只摘掉「禁止联网」，--locked 保留：版本仍锁死在 Cargo.lock，
-      #   结果可复现；缺的 crate 当场补下。
+      #   只摘「禁止联网」，--locked 保留（版本仍锁死，结果可复现）。
       #   必须在 diy-part1 之后（私有包是那一步 clone 进来的）。
       # =========================================================
       - name: Relax cargo offline flags
@@ -916,21 +858,13 @@ jobs:
 
       # =========================================================
       # 9. defconfig + 校验机型
-      #     【唯一一次 defconfig】后续步骤不再调用，避免 .config 被重新展开、
-      #     机型配置里显式写死的选择被静默剔除
+      #    【唯一一次 defconfig】后续不再调用，避免 .config 被重新展开、
+      #    机型配置里写死的选择被静默剔除。
       # =========================================================
-      # =========================================================
-      # ★ 用 runner 预装工具替代从源码编译（OpenWRT-CI 核心思路）
-      #
-      #   Go external bootstrap   省 40~70 分钟
-      #   Rust prebuilt           省 30~60 分钟
-      #   BPF host LLVM / Python PGO 关闭
-      #
-      #   ⚠ 必须在 make defconfig 之前：脚本写进 .config 的配置项
-      #     要由 defconfig 展开确认。
-      #
-      #   全部软失败 —— ponwrt 不支持时只 warning，退回源码编译，
-      #   绝不让构建死在这里。
+      # ★ 用 runner 预装工具替代源码编译（OpenWRT-CI 核心思路）：
+      #   Go external bootstrap 省 40~70 分钟、Rust prebuilt 省 30~60 分钟。
+      # ⚠ 必须在 make defconfig 之前 —— 脚本写进 .config 的项要由 defconfig 展开。
+      #   全部软失败：ponwrt 不支持时只 warning，退回源码编译。
       # =========================================================
       - name: Prepare host toolchain (Go / BPF / Python)
         if: env.PREBUILT_HOST == 'true'
@@ -1117,14 +1051,9 @@ jobs:
 
       # =========================================================
       # 10. 编译工具链 —— 只在缓存没给出工具链时才动手
-      #
-      #   ★ 与 OpenWRT-CI 一致：判断依据只有一个 —— 2.2 那步拿到的
-      #     cache-matched-key。命中（哪怕只是前缀回退命中）就整段跳过；
-      #     没命中才编，编完由后面的 Save build cache 存成新一代。
-      #
-      #   ⚠ 以前是按「指纹是否相等」来判断的：那套逻辑里两端算不齐
-      #     就等于永远冷编译，而且没有任何自愈路径 —— 每次都在
-      #     "Cache not found" 之后完整重编 1~1.5 小时。
+      #   判断依据只有一个：2.2 拿到的 cache-matched-key。命中（含前缀回退）
+      #   就整段跳过，没命中才编。
+      # ⚠ 别改回「按指纹是否相等」：两端算不齐就等于永远冷编译，无自愈路径。
       # =========================================================
       - name: Build tools & toolchain
         id: toolchain
@@ -1146,21 +1075,12 @@ jobs:
           mkdir -p tmp && echo 1 > tmp/.build
 
       # =========================================================
-      # 10.02 host 侧 go / rust 从源码真实编译（prebuilt_host=false 时）
-      #
-      #   为什么单独拎出来编，而不是等 make 自动带出来：
-      #     golang / rust 是【package】不是 tools —— `make tools/install`
-      #     和 `make toolchain/install` 都不含它们，它们是在
-      #     `make package/compile`（也就是固件编译那 5~6 小时）里被
-      #     依赖带出来的。那样有两个坏处：
-      #       1) 无法在 toolchain-only 这一趟里把缓存建全
-      #       2) 首次编译要多扛 1.5 小时，直接顶到 350 分钟上限
-      #     所以这里显式编：编完紧跟下一步的 early save，就都进缓存了。
-      #
-      #   ⚠ 只能写 host/compile —— 没有 host/install 这个目标。
-      #     host-build.mk 的依赖链是
-      #       host-compile → $(HOST_STAMP_INSTALLED) → Host/Install
-      #     即 host/compile 会自动把产物装进 staging_dir。
+      # 10.02 host 侧 go / rust 从源码真实编译（prebuilt_host=false）
+      #   golang / rust 是 package 不是 tools，tools/install 与 toolchain/install
+      #   都不含它们，只在 package/compile（固件那 5~6 小时）里被带出来 →
+      #   ① toolchain-only 这趟建不全缓存 ② 首次多扛 1.5 小时、顶到 350 分钟上限。
+      # ⚠ 只能写 host/compile（没有 host/install 目标）：host-build.mk 的链是
+      #   host-compile → $(HOST_STAMP_INSTALLED) → Host/Install，产物自动进 staging_dir。
       # =========================================================
       - name: Build host go/rust from source
         id: host-src
@@ -1205,22 +1125,14 @@ jobs:
           touch tools/stamp-compile toolchain/stamp-compile 2>/dev/null || true
 
       # =========================================================
-      # 10.05 ★ 工具链一编完就存一次缓存（不等编译结束）
-      #
-      #   为什么：job 的 timeout-minutes 是 350，而全量编译经常跑满
-      #   5~6 小时。一旦超时，GitHub 会把 job 直接 cancel —— 排在
-      #   编译后面的「Save build cache」根本没机会执行，1~1.5 小时的
-      #   工具链白编。
-      #
-      #   这里在工具链刚编完、固件还没开始时先存一份。超时也罢、
-      #   编译失败也罢，下次都能直接跳过 tools/toolchain。
-      #
-      #   代价：本次编译期间增长的 .ccache 不在这一份里（下一轮补）。
-      #   ccache 是可再生的，丢它比丢工具链便宜得多。
-      #
-      #   ⚠ 后面「Save build cache」用的是同一个 key。早期已经存过时
-      #     这里会跳过它（条件里看 save-early 的 outcome），否则那次 save
-      #     只会拿到 "already exists" 的报错，白跑一趟。
+      # 10.05 ★ 工具链一编完就存一次（不等编译结束）
+      #   350 分钟一到 GitHub 直接 cancel job，排在编译后面的 Save 根本没机会跑，
+      #   1~1.5 小时的工具链就白编了。
+      #   代价：本次编译期间增长的 .ccache 不在这份里（下一轮补，ccache 可再生）。
+      # ⚠ key 带 -early 后缀，不能与正式 key 相同：actions/cache 一个 key 只能存
+      #   一次，同 key 会让这份「只有工具链」的早期缓存把完整版挡在门外
+      #   （实测早期 220 MB / 完整 554 MB，差的正是 hostpkg，导致每轮重编 go/rust）。
+      #   轮换侧由 cache-roll.jq 剥掉 -early 分组，正式 key 在则 -early 退场。
       # =========================================================
       - name: Save build cache (right after toolchain)
         id: save-early
@@ -1236,7 +1148,9 @@ jobs:
         uses: actions/cache/save@v5
         continue-on-error: true
         with:
-          key: ${{ steps.cache-key.outputs.key }}
+          # -early 后缀：见上面的说明，不能和正式 key 相同，
+          # 否则这份「只有工具链」的缓存会把后面完整的正式缓存挡掉。
+          key: ${{ steps.cache-key.outputs.key }}-early
           path: |
             ${{ env.CACHE_ROOT }}/.ccache
             ${{ env.CACHE_ROOT }}/staging_dir/host*
@@ -1277,21 +1191,12 @@ jobs:
           echo "编译工具链: ${{ steps.toolchain.outcome }}"
 
       # =========================================================
-      # 12.5 ccache 补装（仅 USE_CCACHE=true 时执行）
-      #
-      #   ccache 二进制由 tools/ccache 安装到 staging_dir/host/bin。
-      #   tools/Makefile：
-      #     ifneq ($(CONFIG_CCACHE)$(CONFIG_SDK),)
-      #       tools-y += ccache xxhash
-      #   即只有 CONFIG_CCACHE 生效时才会编入。
-      #
-      #   问题场景：工具链缓存命中 → 上面跳过 make tools/install →
-      #   ccache 不在缓存里（缓存是未开 ccache 时建的）→
-      #   rules.mk 的 TARGET_CC:= ccache $(TARGET_CC) 找不到二进制：
-      #     /bin/sh: 1: .../staging_dir/host/bin/ccache: not found (Error 127)
-      #
-      #   故这里单独补装 tools/ccache，并在失败时自动关闭 ccache 继续编译，
-      #   绝不因 ccache 让整次构建失败。
+      # 12.5 ccache 补装（仅 USE_CCACHE=true）
+      #   ccache 由 tools/ccache 装到 staging_dir/host/bin，只有 CONFIG_CCACHE
+      #   生效时才编（tools/Makefile: tools-y += ccache xxhash）。
+      # ⚠ 缓存命中时 make tools/install 被跳过；若那份缓存是未开 ccache 时建的，
+      #   rules.mk 的 TARGET_CC := ccache $(TARGET_CC) 会找不到二进制 → Error 127。
+      #   故这里单独补装，失败就自动关掉 ccache 继续编译。
       # =========================================================
       - name: Setup ccache (opt-in)
         if: env.USE_CCACHE == 'true'
@@ -1377,19 +1282,11 @@ jobs:
 
       # =========================================================
       # 17.5 存 dl 缓存
-      #
-      #   ★ 位置很关键：放在【编译之前】。
-      #     放到最后用 always() 也能覆盖「编译失败」，但覆盖不了
-      #     「超时被取消」—— 350 分钟一到，job 被 cancel，后面所有
-      #     步骤（含 always()）都来不及跑，几个 G 的 dl 白下。
-      #     这个仓库是手动编译、很容易跑到超时，所以宁可在这里存。
-      #
-      #   代价：编译阶段才下载的零星文件这轮不会进缓存，下次
-      #   `make download` 会补上 —— 相比丢整份 dl，可以忽略。
-      #
-      #   ⚠ 只在 package 步真跑成功时存（toolchain-only 不算）：
-      #     否则一份只含工具链源码的残缺 dl 会占掉本周的 key，
-      #     同周后续 firmware 运行命中的就是这份残缺内容。
+      # ★ 必须放在编译之前：350 分钟一到 job 被 cancel，后面所有步骤（含
+      #   always()）都来不及跑，几个 G 的 dl 白下。代价是编译期才下的零星文件
+      #   这轮进不了缓存，下一轮 make download 会补。
+      # ⚠ 只在 package 步真跑成功时存：否则一份只含工具链源码的残缺 dl 会占掉
+      #   本周的 key，同周后续 firmware 命中的就是这份残缺内容。
       # =========================================================
       - name: Save dl cache
         if: >-
@@ -1435,23 +1332,20 @@ jobs:
           echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> "$GITHUB_ENV"
 
       # =========================================================
-      # 18.5 存新一代缓存 —— 移植自 OpenWRT-CI 的 Save Build Cache
-      #
-      #   三条判断，缺一不可：
-      #     success()                        编译过的东西才可信
-      #     cache-hit != true                精确命中说明内容没变，不用重存
-      #                                       （前缀回退命中【要】存：那一代已经旧了，
-      #                                         这就是缓存「自动向前滚动」的动作）
-      #     compile/toolchain 至少一个成功  toolchain-only 预热的运行也要存
-      #
-      #   ⚠ 同 key 已存在时 save 会报 "already exists"，属正常，
-      #     continue-on-error 兜住，不影响构建结论。
+      # 18.5 存新一代缓存
+      #   三条判断缺一不可：
+      #     success()                    编译过的东西才可信
+      #     cache-hit != true            精确命中说明内容没变（前缀回退命中【要】存，
+      #                                  那正是缓存向前滚动的动作）
+      #     compile/toolchain 任一成功  toolchain-only 的预热也要存
+      # ⚠ 不判断 save-early：它存的是 <key>-early，与本处正式 key 不同、可共存，
+      #   而正式这份才是完整的（含编译阶段才带出来的 hostpkg）。
+      #   同 key 已存在会报 already exists，continue-on-error 兜住，属正常。
       # =========================================================
       - name: Save build cache
         if: >-
           success()
           && steps.cache-restore.outputs.cache-hit != 'true'
-          && steps.save-early.outcome != 'success'
           && (steps.compile.outcome == 'success' || steps.toolchain.outcome == 'success')
         uses: actions/cache/save@v5
         continue-on-error: true
@@ -1463,16 +1357,11 @@ jobs:
             ${{ env.CACHE_ROOT }}/staging_dir/tool*
 
       # =========================================================
-      # 18.6 存一份到 Release 备份（长期，不受 7 天回收影响）
-      #
-      #   与上一步同一份内容、同一个 key，只是换了存放介质：
-      #     actions/cache  快，但 7 天无访问就没了
-      #     Release 资产    慢（~1GB 走 gh 下载），但一直在
-      #
-      #   ★ 顺序：先上传新的，再删同前缀的旧代。
-      #     反过来的话，上传失败就变成「旧的删了、新的没上去」——
-      #     备份通道就此归零。
-      #   ★ 单文件超过 2 GiB 会被 GitHub 拒，先量体积再决定要不要传。
+      # 18.6 存一份到 Release 备份
+      #   与上一步同一份内容，只换介质：actions/cache 快但 7 天回收，
+      #   Release 慢（~1 GB）但永久。
+      # ⚠ 先上传新的再删旧代 —— 反过来一旦上传失败，备份通道就归零。
+      # ⚠ 单文件超 2 GiB 会被拒，先量体积再决定传不传。
       # =========================================================
       - name: Save cache to Release backup
         if: >-
@@ -1655,16 +1544,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # =========================================================
-  # 缓存轮换 —— 移植自 OpenWRT-CI 的 cache-rollover job
-  #
-  #   每次构建都换一代 key（提交号变了），旧代再也没人用却一直占着
-  #   actions/cache 的 10GB 配额。这个 job 只保留当前这一代。
-  #
-  #   单独成 job 而不是并进 build，原因和上游一致：
-  #     - 它必须有 concurrency，避免两个构建同时跑时互相删掉对方刚存的
-  #     - 它失败不该影响构建结论
-  #   脚本内部还会先确认「当前 key 已在缓存里」再删，
-  #   避免把唯一一份删掉（save 落库有秒级延迟）。
+  # 缓存轮换 —— 每次构建换一代 key，旧代没人用却占着 10GB 配额
+  #   单独成 job 而不是并进 build：它需要 concurrency（避免两个构建互删
+  #   对方刚存的那代），且失败不该影响构建结论。
+  #   脚本内部先确认「当前 key 已在缓存里」再删，避免删掉唯一一份。
   # =========================================================
   cache-rollover:
     name: Roll build cache

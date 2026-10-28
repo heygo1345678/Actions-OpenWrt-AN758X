@@ -1,17 +1,12 @@
 name: Keep Build Caches Alive
 
 # =========================================================
-# actions/cache 的条目 7 天没人访问就会被回收。
-#
-#   移植 OpenWRT-CI 的滚动缓存之后，「访问」这件事有了更省的做法：
-#   缓存是目录形态、key 是「前缀+提交号」，所以只要按前缀把最新那一代
-#   真恢复一次，就算访问过（同时顺带验证了这份缓存在不在、能不能解开）。
-#
-#   ⚠ 不做 lookup-only：实测那条路径既不能可靠命中，也不一定刷新
-#     lastAccessedAt —— 两个目的都落空。这里一律用真实 restore。
-#
-#   ⚠ 也【不用】前缀回退去猜：先把实际存在的 key 列出来，
-#     再逐个按精确 key 恢复。能命中就一定能看到，命中不了也看得见。
+# actions/cache 的条目 7 天没人访问就回收。
+#   缓存是目录形态、key = 前缀 + 提交号，所以按前缀把最新一代真恢复一次
+#   就算访问过（顺带验证了它在不在、能不能解开）。
+# ⚠ 不做 lookup-only：实测既不能可靠命中，也不一定刷新 lastAccessedAt。
+# ⚠ 也不用前缀回退去猜：先列出实际存在的 key，再逐个按精确 key 恢复 ——
+#   能命中就一定看得见，命中不了也看得见。
 # =========================================================
 
 on:
@@ -60,13 +55,22 @@ jobs:
             | sort -r
 
           # 「同族」判定与 scripts/cache-roll.jq 一致：
-          #   工具链缓存去掉末尾 40 位提交号、dl 缓存去掉末尾 6 位周号。
-          #   每族只取最新一条去恢复 —— 把每条历史 dl（2~5 GB）都下下来
-          #   纯属浪费，它们互为超集。
+          #   先剥 -early（工具链刚编完时存的早期版），再剥末尾 40 位提交号，
+          #   最后剥 dl 的 6 位周号。每族只取一条去恢复 —— 把每条历史 dl
+          #   （2~5 GB）都下下来纯属浪费，它们互为超集。
+          #   同族里优先取「不带 -early 的正式 key」：它才是完整版
+          #   （含 golang / rust hostpkg），-early 只有 tools/toolchain。
           KEYS=$(jq -r '
             [ .[] | select(.key | startswith("ponwrt-")) ]
-            | group_by(.key | sub("-[0-9a-f]{40}$"; "") | sub("-[0-9]{6}$"; ""))
-            | map(sort_by(.createdAt) | last | .key)
+            | group_by(.key
+                | sub("-early$"; "")
+                | sub("-[0-9a-f]{40}$"; "")
+                | sub("-[0-9]{6}$"; ""))
+            | map(
+                (sort_by(.createdAt) | reverse) as $g
+                | (($g | map(select(.key | endswith("-early") | not)) | first)
+                   // $g[0]) | .key
+              )
             | .[]' all.json)
 
           COUNT=$(printf '%s\n' "$KEYS" | grep -c . || true)

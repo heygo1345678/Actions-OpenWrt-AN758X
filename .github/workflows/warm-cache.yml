@@ -1,26 +1,16 @@
 name: Warm Build Cache
 
 # =========================================================
-# 预热「整体构建缓存」—— 与 build-ponwrt.yml 用同一套 key 口径
+# 预热「整体构建缓存」—— 与 build-ponwrt.yml 共用 scripts/pwrt-cache.sh 的
+# key 算法，所以「预热出来的」和「主流程要的」永远是同一条线下的相邻代，
+# 主流程靠 restore-keys 前缀回退必定能取到。
 #
-#   移植自 VIKINGYFY/OpenWRT-CI 的滚动缓存：
-#     一份缓存 = staging_dir/host* + staging_dir/tool* + .ccache
-#     key       = ponwrt-<源站>-<分支>-<SoC>-<上游提交号>
-#     回退键   = ponwrt-<源站>-<分支>-<SoC>-
+#   一份缓存 = staging_dir/host* + staging_dir/tool* + .ccache
+#   两条通道同一份内容：actions/cache（快、7 天回收）+ Release（慢、永久），
+#   预热时两条都写，保证任一时刻两边都有东西可取。
 #
-#   ★ 两个 workflow 都调 scripts/pwrt-cache.sh key，前缀算法只有一处，
-#     所以「预热出来的」和「主流程要的」永远是同一条目录下的相邻代，
-#     主流程靠 restore-keys 前缀回退必定能取到。
-#     以前那种「指纹两端各算一遍，算不齐就永不命中」的坑在这里不存在。
-#
-#   ★ 两条通道，同一份内容：actions/cache（快、7 天会被回收）
-#     + Release 备份（慢、永不过期）。主流程按 ①→② 的顺序恢复，
-#     这里预热时也两条都写，保证任一时刻两边都有东西可取。
-#
-#   它的两个用途：
-#     1) 冷启动：主流程第一次跑不必现编工具链
-#     2) 保活：定时跑一次，相当于给缓存做一次 restore（刷新 lastAccessedAt），
-#        避免 7 天未访问被回收
+#   用途：① 冷启动 —— 主流程第一次不必现编工具链
+#         ② 保活 —— 定时跑一次即刷新 lastAccessedAt，避开 7 天回收
 # =========================================================
 
 on:
