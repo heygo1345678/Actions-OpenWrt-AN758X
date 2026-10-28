@@ -80,13 +80,18 @@
 
 ## 构建缓存（移植自 VIKINGYFY/OpenWRT-CI）
 
-一份缓存 = 三个目录，同一份内容存两个地方：
+一份缓存 = 四个目录：
 
 ```
 staging_dir/host*      host 工具 + hostpkg（go / python 在这）
 staging_dir/tool*      交叉编译器
+build_dir/host         仅快通道有：带 tools/* 的 .built 戳，省掉每轮 12~13 分钟
 .ccache                编译对象缓存
 ```
+
+`build_dir/host` 只进 `actions/cache`，不进 Release 备份（备份是过期兜底，多传
+300 MB 换一次 13 分钟不划算）。`build_dir/toolchain-*`（3~4 GB）和 `build_dir/hostpkg`
+也都没进缓存 —— 前者靠 ccache 压到 13 分钟，后者缺失只影响 go 的一次补编。
 
 | 通道 | 介质 | 特点 |
 |---|---|---|

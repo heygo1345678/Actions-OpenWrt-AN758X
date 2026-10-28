@@ -6,6 +6,9 @@
 #        staging_dir/host*   host + hostpkg（go / python 在这）
 #        staging_dir/tool*   交叉编译器
 #        .ccache             编译对象缓存
+#        build_dir/host      仅 actions/cache 那条通道有它（见 cache_paths）
+#                            作用：带上 tools/* 的 .built 戳，省掉每轮
+#                            12~13 分钟的 tools 重编
 #   2) key = 前缀 + 上游提交号，restore-keys = 前缀-
 #      前缀只由「源站 + 分支 + SoC + HOST_MODE」决定，提交号变了只是换一代，
 #      恢复靠前缀回退拿到最近一代 —— 这是「缓存永远命中」的来源。
@@ -239,6 +242,10 @@ cmd_rollover() {
 #   「哪边先命中都算数」；用相对路径打包，不会把 /workdir 腌进 tar 里。
 # ---------------------------------------------------------------
 cache_paths() {   # 打印要打包的顶层条目（不存在的跳过）
+  # ⚠ 这里只服务于 Release 备份（pack/unpack），刻意【不含】build_dir/host：
+  #   它是 actions/cache 快通道额外的加速项（省 12~13 分钟 tools 重编），
+  #   压缩后 ~300 MB。备份通道是「缓存过期后的兜底」，多传 300 MB 换
+  #   一次 13 分钟不划算 —— 兜底时重编 tools 是可接受的。
   [ -e .ccache ] && echo ".ccache"
   ls -d staging_dir/host staging_dir/hostpkg staging_dir/toolchain* 2>/dev/null
   return 0
