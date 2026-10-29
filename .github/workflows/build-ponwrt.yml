@@ -1228,7 +1228,7 @@ jobs:
           elif [ -n "$MATCHED" ]; then
             DECISION="actions/cache 前缀回退命中上一代，工具链没编；本次存新一代"
           elif [ "$REL" = "true" ] && [ "$RELKEY" = "$KEY" ]; then
-            DECISION="从 Release 备份恢复，且就是当前提交那一份 —— 工具链一步没编"
+            DECISION="从 Release 备份恢复，且就是当前提交那一份 —— tools/toolchain 一步没编；但 host go/rust 与 build_dir 戳本轮仍会产出，结束时会存回去"
           elif [ "$REL" = "true" ]; then
             DECISION="从 Release 备份恢复的是旧代，工具链需补编；本次回填快通道"
           else
@@ -1398,12 +1398,13 @@ jobs:
       # 18.5 存新一代缓存
       #   三条判断缺一不可：
       #     success()                    编译过的东西才可信
-      #     cache-hit != true            actions/cache 精确命中说明内容没变（前缀回退
-      #                                  命中【要】存，那正是缓存向前滚动的动作）
-      #     restore 不是同 key 的 Release 恢复
-      #                                  Release 里已有当前提交那一份，无需再存；
-      #                                  是旧代的话仍要回填，否则快通道一直是空的
+      #     cache-hit != true            只有「actions/cache 里就有同 key 条目」才说明
+      #                                  内容确实不用重存；其余情况一律存
       #     compile/toolchain 任一成功  toolchain-only 的预热也要存
+      # ⚠ 不判断 Release 里有没有同 key：Release 是【可覆盖】的（--clobber），
+      #   而 actions/cache 一个 key 只能存一次。「Release 已有该 key」并不能推出
+      #   「内容一致」——本轮可能刚补编完 hostpkg、刚冻出一批 build_dir 戳，
+      #   这些只有存回去下一轮才用得上。曾经因为跳过，导致 go/rust 白自举一轮。
       # ⚠ 不判断 save-early：它存的是 <key>-early，与本处正式 key 不同、可共存，
       #   而正式这份才是完整的（含编译阶段才带出来的 hostpkg）。
       #   同 key 已存在会报 already exists，continue-on-error 兜住，属正常。
@@ -1412,7 +1413,6 @@ jobs:
         if: >-
           success()
           && steps.cache-restore.outputs.cache-hit != 'true'
-          && steps.release-restore.outputs.restored_key != steps.cache-key.outputs.key
           && (steps.compile.outcome == 'success' || steps.toolchain.outcome == 'success')
         uses: actions/cache/save@v5
         continue-on-error: true
@@ -1435,7 +1435,6 @@ jobs:
           env.RELEASE_BACKUP == 'true'
           && success()
           && steps.cache-restore.outputs.cache-hit != 'true'
-          && steps.release-restore.outputs.restored_key != steps.cache-key.outputs.key
           && (steps.compile.outcome == 'success' || steps.toolchain.outcome == 'success')
         continue-on-error: true
         env:
