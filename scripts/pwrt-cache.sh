@@ -112,6 +112,82 @@ cmd_key() {
 }
 
 # ---------------------------------------------------------------
+# host 包的 build_dir 戳 —— 缓存里到底缺了什么
+#
+#   include/host-build.mk 把 host 包的四个戳拆在两处：
+#     INSTALLED  = staging_dir/hostpkg/stamp/.<pkg>_installed   ✅ 跟着缓存走
+#     BUILT      = build_dir/host/<pkg>/.built                  ❌ 不在缓存路径
+#     CONFIGURED = build_dir/host/<pkg>/.configured             ❌
+#     PREPARED   = build_dir/host/<pkg>/.prepared_<md5>          ❌
+#   依赖链是 installed ← built ← configured ← prepared。
+#   build_dir 不缓存 → 恢复后 built 这一层不存在 → make 认为没编过 → 整条链重做。
+#   source 模式下这就是 golang / rust 的完整自举：实测多 20~40 分钟、多写 13~14 GB。
+#
+#   所以只把「戳」冻进缓存，不冻内容：staging_dir 里已经有 installed 产物，
+#   缺的只是「我做过了」这个证据。戳全是 0 字节空文件，100 来个包 × 3 个
+#   ≈ 200 KB，zstd 之后不到 10 KB。
+#
+#   ⚠ 不能直接把 build_dir 加进 with.path：那是 13~14 GB，超 Release 单文件
+#     2 GiB 上限，也会瞬间吃光 actions/cache 的 10 GB 配额。
+#   ⚠ 镜像放 staging_dir/host/.builddir-stamps：staging_dir/host* 本来就在
+#     缓存路径里，actions/cache 与 Release 两条通道都能自动带上，
+#     不用改 workflow 的 with.path。
+#   ⚠ prebuilt 模式一律不冻：那里的 go/rust 是指向 runner 的符号链接，
+#     换镜像后可能悬空；宁可让同一条链重跑一遍自愈（rust-prebuilt.mk 已把
+#     Prepare/Configure/Compile 置空，只花几秒）。
+# ---------------------------------------------------------------
+HOST_STAMP_MIRROR="staging_dir/host/.builddir-stamps"
+
+cmd_freeze() {
+  cd "$OW" || { echo "::error::无法进入 $OW"; exit 1; }
+
+  if [ "${HOST_MODE:-prebuilt}" != "source" ]; then
+    echo "prebuilt 模式：不冻 build_dir 戳（产物是符号链接，重跑一遍更安全）"
+    return 0
+  fi
+
+  rm -rf "$HOST_STAMP_MIRROR"
+  mkdir -p "$HOST_STAMP_MIRROR"
+
+  local n=0 rel
+  while IFS= read -r -d '' f; do
+    rel="${f#./}"
+    mkdir -p "$HOST_STAMP_MIRROR/$(dirname "$rel")"
+    cp -a "$f" "$HOST_STAMP_MIRROR/$rel" 2>/dev/null || continue
+    n=$((n + 1))
+  done < <(find build_dir/host build_dir/hostpkg \
+             -maxdepth 2 -type f \
+             \( -name '.prepared*' -o -name '.configured' -o -name '.built' \) \
+             -print0 2>/dev/null)
+
+  echo "已冻结 build_dir 戳 $n 个（$(du -sh "$HOST_STAMP_MIRROR" 2>/dev/null | cut -f1)）-> $HOST_STAMP_MIRROR"
+  [ "$n" -gt 0 ] || echo "::warning::一个戳都没找到 —— build_dir 可能已被清理，下一轮仍会自举"
+}
+
+thaw_host_stamps() {
+  [ -d "$HOST_STAMP_MIRROR" ] || return 0
+
+  if [ "${HOST_MODE:-prebuilt}" != "source" ]; then
+    echo "prebuilt 模式：忽略 build_dir 戳镜像"
+    return 0
+  fi
+
+  local n=0 rel
+  while IFS= read -r -d '' f; do
+    rel="${f#./}"
+    mkdir -p "$(dirname "$rel")"
+    cp -a "$HOST_STAMP_MIRROR/$rel" "$rel" 2>/dev/null || continue
+    n=$((n + 1))
+  done < <(cd "$HOST_STAMP_MIRROR" && find . -type f -print0)
+
+  if [ "$n" -gt 0 ]; then
+    echo "已还原 build_dir 戳 $n 个 —— 这些 host 包 make 会跳过，不再自举 go/rust"
+  else
+    echo "::warning::戳镜像存在但还原了 0 个，本轮仍会自举"
+  fi
+}
+
+# ---------------------------------------------------------------
 # prepare —— 恢复缓存之后的「让 make 认账」步骤
 #
 #   ⚠ 范围只到「非 target」：
@@ -122,6 +198,11 @@ cmd_key() {
 # ---------------------------------------------------------------
 cmd_prepare() {
   cd "$OW" || { echo "::error::无法进入 $OW"; exit 1; }
+
+  # 先把 build_dir 的 host 戳还原回去，再刷新 staging 的戳 ——
+  # 顺序不能反：还原的戳要保持构建时的旧 mtime，而 installed 要刷成「现在」，
+  # 这样 installed 才比 built 新，make 不会重跑 install。
+  thaw_host_stamps
 
   local nstamp=0
   while IFS= read -r d; do
@@ -406,6 +487,10 @@ cmd_status() {
       [ -e "$d" ] || continue
       printf '%-52s %s\n' "$d" "$(du -sh "$d" 2>/dev/null | cut -f1)"
     done
+    printf '%-52s %s\n' "  .built 戳" \
+      "$(find build_dir/host build_dir/hostpkg -maxdepth 2 -type f -name '.built' 2>/dev/null | wc -l) 个"
+    printf '%-52s %s\n' "$HOST_STAMP_MIRROR（冻进缓存的镜像）" \
+      "$([ -d "$HOST_STAMP_MIRROR" ] && echo "$(du -sh "$HOST_STAMP_MIRROR" 2>/dev/null | cut -f1) / $(find "$HOST_STAMP_MIRROR" -type f 2>/dev/null | wc -l) 个戳" || echo 无)"
     echo ""
     echo "=== 标记 ==="
     for f in tools/stamp-compile toolchain/stamp-compile tmp/.build; do
@@ -423,10 +508,11 @@ case "$CMD" in
   prepare)  cmd_prepare ;;
   rollover) cmd_rollover ;;
   pack)     cmd_pack   "${3:-}" ;;
+  freeze)   cmd_freeze ;;
   unpack)   cmd_unpack "${3:-}" ;;
   status)   cmd_status ;;
   *)
-    echo "用法: $0 {key|prefix|prepare|rollover|pack|unpack|status} <openwrt_dir> [file]" >&2
+    echo "用法: $0 {key|prefix|prepare|freeze|rollover|pack|unpack|status} <openwrt_dir> [file]" >&2
     exit 1
     ;;
 esac
