@@ -1173,6 +1173,12 @@ jobs:
             fi
           done
 
+          # ★ 立刻把 build_dir 的 host 戳冻一份（source 模式专用）。
+          #   为什么不等编译结束：后面还有最长 200 分钟的编译，一旦超时或失败，
+          #   存下来的缓存就没有戳，下一轮 go/rust 又要自举一遍。
+          #   编译结束后还会再冻一次，覆盖 target 阶段新编出来的 host 包。
+          bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" freeze "$CACHE_ROOT" || true
+
       # =========================================================
       # 10.05 ★ 工具链一编完就存一次（不等编译结束）
       #   350 分钟一到 GitHub 直接 cancel job，排在编译后面的 Save 根本没机会跑，
@@ -1383,6 +1389,10 @@ jobs:
           df -hT /
           echo "status=success" >> "$GITHUB_OUTPUT"
           echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> "$GITHUB_ENV"
+
+          # 全量再冻一次：target 阶段会顺带编出一批 host 包（python3 等），
+          # 这些戳只有编译结束才存在。source 模式下它们同样会被自举。
+          bash "$GITHUB_WORKSPACE/scripts/pwrt-cache.sh" freeze "$CACHE_ROOT" || true
 
       # =========================================================
       # 18.5 存新一代缓存
