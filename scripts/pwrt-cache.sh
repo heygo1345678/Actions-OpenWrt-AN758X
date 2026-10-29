@@ -166,6 +166,12 @@ cmd_freeze() {
 
   echo "已冻结 build_dir 戳 $n 个（$(du -sh "$HOST_STAMP_MIRROR" 2>/dev/null | cut -f1)）-> $HOST_STAMP_MIRROR"
   [ "$n" -gt 0 ] || echo "::warning::一个戳都没找到 —— build_dir 可能已被清理，下一轮仍会自举"
+
+  # 把包名列出来：下一轮能不能跳过自举，全看这里有没有 golang / rust
+  local pkgs
+  pkgs=$(cd "$HOST_STAMP_MIRROR" && find . -mindepth 3 -name '.built' -printf '%h\n' 2>/dev/null \
+         | sed 's#^\./##' | sort -u | head -20 | tr '\n' ' ')
+  [ -n "$pkgs" ] && echo "  覆盖的 host 包: $pkgs"
 }
 
 thaw_host_stamps() {
