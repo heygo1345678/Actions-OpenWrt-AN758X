@@ -142,6 +142,10 @@ cmd_freeze() {
   cd "$OW" || { echo "::error::无法进入 $OW"; exit 1; }
 
   if [ "${HOST_MODE:-prebuilt}" != "source" ]; then
+    # 顺手清掉上一次 source 模式留下的镜像：否则它会跟着 prebuilt 的缓存
+    # 一路滚下去，将来切回 source 时又用一个早已对不上的旧镜像
+    # （.prepared 的名字带源码 MD5，对不上会重建，但没必要留这个噪音）。
+    rm -rf "$HOST_STAMP_MIRROR"
     echo "prebuilt 模式：不冻 build_dir 戳（产物是符号链接，重跑一遍更安全）"
     return 0
   fi
